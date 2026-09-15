@@ -1,9 +1,11 @@
+mod usage;
+
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use credentials_provider::CredentialsProvider;
-use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
-use gpui::{App, AsyncApp, Context, Entity, SharedString, Task, WeakEntity};
+use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture, future::Shared};
+use gpui::{App, AsyncApp, Context, Entity, SharedString, Task, TaskExt as _, WeakEntity};
 use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt as _,
     http::{HeaderName, HeaderValue},
@@ -15,13 +17,13 @@ use language_model::{
 };
 use open_ai::{
     ReasoningEffort,
-    responses::{ResponseInputItem, stream_response},
+    responses::{ResponseInputItem, stream_response_ref},
 };
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{collections::BTreeMap, sync::Arc};
 use url::form_urlencoded;
 use util::ResultExt as _;
 
@@ -53,6 +55,8 @@ struct CodexCredentials {
     expires_at_ms: u64,
     account_id: Option<String>,
     email: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 impl CodexCredentials {
@@ -68,10 +72,161 @@ enum SignInState {
     PersistingCredentials { _task: Task<Result<()>> },
 }
 
-pub struct State {
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSwitchPolicy {
+    Manual,
+    #[default]
+    OnError,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Account {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     credentials: Option<CodexCredentials>,
+    #[serde(default)]
+    needs_reauth: bool,
+    #[serde(default)]
+    billing_blocked: bool,
+    #[serde(default)]
+    unavailable_until_ms: u64,
+    #[serde(default)]
+    quota_until_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocked_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    status: String,
+}
+
+impl Account {
+    fn available(&self, model: &str) -> bool {
+        self.credentials.is_some()
+            && !self.needs_reauth
+            && !self.billing_blocked
+            && self.unavailable_until_ms <= now_ms()
+            && self.quota_until_ms <= now_ms()
+            && !self.blocked_models.iter().any(|blocked| blocked == model)
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Accounts {
+    accounts: BTreeMap<String, Account>,
+    selected: String,
+}
+
+impl Accounts {
+    fn insert(&mut self, credentials: CodexCredentials) {
+        let id = credentials
+            .account_id
+            .clone()
+            .or_else(|| credentials.email.clone())
+            .unwrap_or_else(|| "legacy".into());
+        let mut account = Account {
+            credentials: Some(credentials),
+            ..Default::default()
+        };
+        if let Some(previous) = self.accounts.get(&id) {
+            account.quota_until_ms = previous.quota_until_ms;
+            if account.quota_until_ms > now_ms() {
+                account.status = "Plan quota reached".into();
+            }
+        }
+        self.accounts.insert(id.clone(), account);
+        self.selected = id;
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if let Ok(accounts) = serde_json::from_slice::<Self>(bytes) {
+            return Ok(accounts);
+        }
+        let mut accounts = Self::default();
+        accounts.insert(serde_json::from_slice(bytes)?);
+        Ok(accounts)
+    }
+}
+
+fn account_credentials_key(id: &str) -> String {
+    let digest = Sha256::digest(id.as_bytes());
+    format!(
+        "{CREDENTIALS_KEY}/accounts/{}",
+        URL_SAFE_NO_PAD.encode(digest)
+    )
+}
+
+async fn load_accounts(provider: &dyn CredentialsProvider, cx: &AsyncApp) -> Result<Accounts> {
+    let Some((_, bytes)) = provider.read_credentials(CREDENTIALS_KEY, cx).await? else {
+        return Ok(Accounts::default());
+    };
+    let mut accounts = Accounts::decode(&bytes)?;
+    for (id, account) in &mut accounts.accounts {
+        if account.credentials.is_none() {
+            let key = account_credentials_key(id);
+            if let Some((_, bytes)) = provider.read_credentials(&key, cx).await? {
+                account.credentials = Some(serde_json::from_slice(&bytes)?);
+            } else {
+                account.needs_reauth = true;
+                account.status = "Saved credentials are missing. Sign in again".into();
+            }
+        }
+    }
+    Ok(accounts)
+}
+
+async fn save_accounts(
+    provider: &dyn CredentialsProvider,
+    accounts: &Accounts,
+    cx: &AsyncApp,
+) -> Result<()> {
+    let previous = match provider.read_credentials(CREDENTIALS_KEY, cx).await? {
+        Some((_, bytes)) => match Accounts::decode(&bytes) {
+            Ok(previous) => previous,
+            Err(error) if accounts.accounts.is_empty() => {
+                log::warn!("Removing unreadable ChatGPT credential index: {error}");
+                Accounts::default()
+            }
+            Err(error) => return Err(error),
+        },
+        None => Accounts::default(),
+    };
+    let mut index = accounts.clone();
+    for (id, account) in &mut index.accounts {
+        if let Some(credentials) = account.credentials.take() {
+            let key = account_credentials_key(id);
+            let bytes = serde_json::to_vec(&credentials)?;
+            provider
+                .write_credentials(&key, "Bearer", &bytes, cx)
+                .await?;
+        }
+    }
+    // Publish the index only after all credential records exist, preserving migration on failure.
+    if accounts.accounts.is_empty() {
+        provider.delete_credentials(CREDENTIALS_KEY, cx).await?;
+    } else {
+        let bytes = serde_json::to_vec(&index)?;
+        provider
+            .write_credentials(CREDENTIALS_KEY, "Accounts", &bytes, cx)
+            .await?;
+    }
+    for id in previous
+        .accounts
+        .keys()
+        .filter(|id| !accounts.accounts.contains_key(*id))
+    {
+        provider
+            .delete_credentials(&account_credentials_key(id), cx)
+            .await?;
+    }
+    Ok(())
+}
+
+pub struct State {
+    accounts: Accounts,
+    usage_requests: BTreeMap<String, usage::UsageRequest>,
+    configured_policy: Option<AccountSwitchPolicy>,
+    persistence_task: Option<Shared<Task<Result<(), Arc<anyhow::Error>>>>>,
     sign_in_state: SignInState,
-    refresh_task: Option<Shared<Task<Result<CodexCredentials, Arc<anyhow::Error>>>>>,
+    refresh_tasks: BTreeMap<String, Shared<Task<Result<CodexCredentials, Arc<anyhow::Error>>>>>,
     load_task: Option<Shared<Task<Result<(), Arc<anyhow::Error>>>>>,
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
@@ -114,30 +269,20 @@ impl State {
             .spawn({
                 let credentials_provider = credentials_provider.clone();
                 async move |this, cx| {
-                    let result = credentials_provider
-                        .read_credentials(CREDENTIALS_KEY, cx)
-                        .await;
+                    let result = load_accounts(credentials_provider.as_ref(), cx).await;
                     let refresh_models_task = this.update(cx, |state, cx| {
+                        if state.auth_generation != 0 {
+                            return None;
+                        }
                         match result {
-                            Ok(Some((_, bytes))) => {
-                                match serde_json::from_slice::<CodexCredentials>(&bytes) {
-                                    Ok(credentials) => {
-                                        state.auth_generation =
-                                            state.auth_generation.wrapping_add(1);
-                                        state.credentials = Some(credentials);
-                                    }
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Failed to deserialize ChatGPT subscription credentials: {error}"
-                                        );
-                                    }
-                                }
+                            Ok(accounts) => {
+                                state.auth_generation = state.auth_generation.wrapping_add(1);
+                                state.accounts = accounts;
                             }
-                            Ok(None) => {}
                             Err(error) => {
-                                log::error!(
-                                    "Failed to load ChatGPT subscription credentials: {error:#}"
-                                );
+                                log::error!("Failed to load ChatGPT accounts: {error:#}");
+                                state.last_auth_error =
+                                    Some("Failed to load saved ChatGPT accounts.".into());
                             }
                         }
                         state
@@ -159,9 +304,12 @@ impl State {
             .shared();
 
         Self {
-            credentials: None,
+            accounts: Accounts::default(),
+            usage_requests: BTreeMap::new(),
+            configured_policy: None,
+            persistence_task: None,
             sign_in_state: SignInState::Idle,
-            refresh_task: None,
+            refresh_tasks: BTreeMap::new(),
             load_task: Some(load_task),
             credentials_provider,
             http_client,
@@ -175,11 +323,134 @@ impl State {
     }
 
     pub fn is_authenticated(&self) -> bool {
-        self.credentials.is_some()
+        self.accounts
+            .accounts
+            .values()
+            .any(|account| account.credentials.is_some() && !account.needs_reauth)
     }
 
     pub fn email(&self) -> Option<&str> {
-        self.credentials.as_ref().and_then(|c| c.email.as_deref())
+        self.accounts
+            .accounts
+            .get(&self.accounts.selected)
+            .and_then(|account| account.credentials.as_ref())
+            .and_then(|credentials| credentials.email.as_deref())
+    }
+
+    pub fn accounts(&self) -> Vec<language_model::LanguageModelAccount> {
+        self.accounts
+            .accounts
+            .iter()
+            .map(|(id, account)| language_model::LanguageModelAccount {
+                id: id.clone(),
+                label: account
+                    .credentials
+                    .as_ref()
+                    .and_then(|credentials| credentials.email.clone())
+                    .unwrap_or_else(|| id.clone()),
+                selected: id == &self.accounts.selected,
+                status: if account.needs_reauth {
+                    "Sign in again".into()
+                } else if account.billing_blocked {
+                    "Billing requires attention".into()
+                } else if account.quota_until_ms > now_ms() {
+                    "Plan quota reached".into()
+                } else if (account.status == "Rate limited"
+                    && account.unavailable_until_ms <= now_ms())
+                    || (account.status == "Plan quota reached"
+                        && account.quota_until_ms <= now_ms())
+                {
+                    String::new()
+                } else {
+                    account.status.clone()
+                },
+            })
+            .collect()
+    }
+
+    pub fn switch_policy(&self) -> AccountSwitchPolicy {
+        self.configured_policy.unwrap_or_default()
+    }
+
+    pub fn configure_switch_policy(
+        &mut self,
+        policy: Option<AccountSwitchPolicy>,
+        cx: &mut Context<Self>,
+    ) {
+        self.configured_policy = policy;
+        cx.notify();
+    }
+
+    pub fn select_account(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.accounts.accounts.contains_key(&id) {
+            return;
+        }
+        self.accounts.selected = id;
+        self.reset_model_catalog();
+        self.persist(cx).detach_and_log_err(cx);
+        self.refresh_model_catalog(cx).detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    pub fn reset_account_availability(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(account) = self.accounts.accounts.get_mut(id) {
+            if account.needs_reauth {
+                return;
+            }
+            account.quota_until_ms = 0;
+            if account.status == "Plan quota reached" {
+                account.status.clear();
+            }
+            self.persist(cx).detach_and_log_err(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn remove_account(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.usage_requests.remove(id);
+        self.accounts.accounts.remove(id);
+        self.refresh_tasks.remove(id);
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        if self.accounts.selected == id {
+            self.accounts.selected = self
+                .accounts
+                .accounts
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_default();
+            self.reset_model_catalog();
+            if self.is_authenticated() {
+                self.refresh_model_catalog(cx).detach_and_log_err(cx);
+            }
+        }
+        self.persist(cx).detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    fn persist(&mut self, cx: &mut Context<Self>) -> Task<Result<(), Arc<anyhow::Error>>> {
+        let previous = self.persistence_task.take();
+        let accounts = self.accounts.clone();
+        let provider = self.credentials_provider.clone();
+        let task = cx
+            .spawn(async move |this, cx| {
+                if let Some(previous) = previous {
+                    previous.await.log_err();
+                }
+                let result = save_accounts(provider.as_ref(), &accounts, cx).await;
+                if result.is_err() {
+                    this.update(cx, |state, cx| {
+                        state.last_auth_error =
+                            Some("Failed to save ChatGPT accounts. Please try again.".into());
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+                result.map_err(Arc::new)
+            })
+            .shared();
+        self.persistence_task = Some(task.clone());
+        cx.spawn(async move |_, _| task.await)
     }
 
     pub fn is_signing_in(&self) -> bool {
@@ -298,29 +569,28 @@ impl State {
         }
 
         let http_client = self.http_client.clone();
+        let load_task = self.load_task.clone();
         let task = cx.spawn(async move |this, cx| {
+            if let Some(load_task) = load_task { load_task.await.map_err(|error| anyhow!("{error}"))?; }
             match do_oauth_flow(http_client, cx).await {
                 Ok(creds) => {
                     this.update(cx, |state, cx| {
                         state.begin_persisting_credentials(cx);
                     })?;
 
-                    let persist_result = async {
-                        let credentials_provider =
-                            this.read_with(cx, |state, _| state.credentials_provider.clone())?;
-                        let json = serde_json::to_vec(&creds)?;
-                        credentials_provider
-                            .write_credentials(CREDENTIALS_KEY, "Bearer", &json, cx)
-                            .await?;
-                        anyhow::Ok(())
-                    }
-                    .await;
+                    let persist_result = this.update(cx, |state, cx| {
+                        state.auth_generation = state.auth_generation.wrapping_add(1);
+                        let id = creds.account_id.clone().or_else(|| creds.email.clone()).unwrap_or_else(|| "legacy".into());
+                        state.refresh_tasks.remove(&id);
+                        state.usage_requests.remove(&id);
+                        state.accounts.insert(creds);
+                        state.persist(cx)
+                    })?.await;
 
                     match persist_result {
                         Ok(()) => {
                             let refresh_models_task = this.update(cx, |state, cx| {
                                 state.auth_generation = state.auth_generation.wrapping_add(1);
-                                state.credentials = Some(creds);
                                 state.last_auth_error = None;
                                 state.refresh_model_catalog(cx)
                             })?;
@@ -376,21 +646,15 @@ impl State {
     /// credentials.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         self.auth_generation += 1;
-        self.credentials = None;
+        self.usage_requests.clear();
+        self.accounts = Accounts::default();
         self.sign_in_state = SignInState::Idle;
-        self.refresh_task = None;
+        self.refresh_tasks.clear();
         self.last_auth_error = None;
         self.reset_model_catalog();
         cx.notify();
-
-        let credentials_provider = self.credentials_provider.clone();
-        cx.spawn(async move |_this, cx| {
-            credentials_provider
-                .delete_credentials(CREDENTIALS_KEY, cx)
-                .await
-                .context("Failed to delete ChatGPT subscription credentials from keychain")?;
-            anyhow::Ok(())
-        })
+        let persist = self.persist(cx);
+        cx.spawn(async move |_this, _cx| persist.await.map_err(|error| anyhow!("{error}")))
     }
 }
 
@@ -532,10 +796,13 @@ pub fn create_language_model(
         model,
         state: state.clone(),
         request_limiter: RateLimiter::new(4),
+        account_id: None,
     })
 }
 
+#[derive(Clone)]
 struct OpenAiSubscribedLanguageModel {
+    account_id: Option<String>,
     id: LanguageModelId,
     model: ChatGptModel,
     state: Entity<State>,
@@ -743,6 +1010,45 @@ async fn list_models(
 }
 
 impl LanguageModel for OpenAiSubscribedLanguageModel {
+    fn account_usage(
+        &self,
+        force: bool,
+        cx: &mut App,
+    ) -> Option<Task<Result<language_model::LanguageModelAccountUsage>>> {
+        let id = self
+            .account_id
+            .clone()
+            .unwrap_or_else(|| self.state.read(cx).accounts.selected.clone());
+        Some(
+            self.state
+                .update(cx, |state, cx| usage::load(state, id, force, cx)),
+        )
+    }
+
+    fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
+    }
+    fn accounts(&self, cx: &App) -> Vec<language_model::LanguageModelAccount> {
+        self.state
+            .read(cx)
+            .accounts()
+            .into_iter()
+            .map(|mut account| {
+                if let Some(id) = &self.account_id {
+                    account.selected = &account.id == id;
+                }
+                account
+            })
+            .collect()
+    }
+
+    fn with_account(&self, id: String) -> Option<Arc<dyn LanguageModel>> {
+        Some(Arc::new(Self {
+            account_id: Some(id),
+            ..self.clone()
+        }))
+    }
+
     fn id(&self) -> LanguageModelId {
         self.id.clone()
     }
@@ -808,26 +1114,12 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
         let request_limiter = self.request_limiter.clone();
+        let account_id = self.account_id.clone();
 
         cx.spawn(async move |cx| {
-            let creds = get_fresh_credentials(&state, &http_client, cx).await?;
-            let extra_headers =
-                codex_extra_headers(&creds, responses_request.prompt_cache_key.as_deref());
-            let access_token = creds.access_token.clone();
-            let response_stream = request_limiter
-                .stream(async move {
-                    stream_response(
-                        http_client.as_ref(),
-                        PROVIDER_NAME.0.as_str(),
-                        CODEX_BASE_URL,
-                        &access_token,
-                        responses_request,
-                        &extra_headers,
-                    )
-                    .await
-                    .map_err(LanguageModelCompletionError::from)
-                })
-                .await?;
+            let response_stream = request_limiter.stream(
+                stream_with_accounts(&state, &http_client, &responses_request, account_id.as_deref(), cx)
+            ).await?;
             let mapper = OpenAiResponseEventMapper::new(PROVIDER_ID);
             let mut event_stream = language_model::stream_in_background(
                 mapper.map_stream(response_stream.boxed()).boxed(),
@@ -924,27 +1216,18 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
         let request_limiter = self.request_limiter.clone();
+        let account_id = self.account_id.clone();
         let executor = cx.background_executor().clone();
 
         let future = cx.spawn(async move |cx| {
-            let creds = get_fresh_credentials(&state, &http_client, cx).await?;
-            let extra_headers =
-                codex_extra_headers(&creds, responses_request.prompt_cache_key.as_deref());
-
-            let access_token = creds.access_token.clone();
             request_limiter
-                .stream(async move {
-                    stream_response(
-                        http_client.as_ref(),
-                        PROVIDER_NAME.0.as_str(),
-                        CODEX_BASE_URL,
-                        &access_token,
-                        responses_request,
-                        &extra_headers,
-                    )
-                    .await
-                    .map_err(LanguageModelCompletionError::from)
-                })
+                .stream(stream_with_accounts(
+                    &state,
+                    &http_client,
+                    &responses_request,
+                    account_id.as_deref(),
+                    cx,
+                ))
                 .await
         });
 
@@ -959,141 +1242,587 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum AccountFailure {
+    Unauthorized,
+    NeedsReauth,
+    Scope(Option<String>),
+    RateLimit(u64),
+    Quota(u64),
+    Billing,
+    Transient,
+    Other,
+}
+
+fn classify_failure(error: &open_ai::RequestError) -> AccountFailure {
+    let open_ai::RequestError::HttpResponseError {
+        status_code,
+        body,
+        headers,
+        ..
+    } = error
+    else {
+        return if matches!(
+            error,
+            open_ai::RequestError::HttpSend { .. } | open_ai::RequestError::ReadResponse { .. }
+        ) || matches!(error, open_ai::RequestError::Other(error) if error.downcast_ref::<std::io::Error>().is_some())
+        {
+            AccountFailure::Transient
+        } else {
+            AccountFailure::Other
+        };
+    };
+    let body_lower = body.to_ascii_lowercase();
+    let payload = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+    let detail = payload.get("error").unwrap_or(&payload);
+    let reset = detail
+        .get("resets_at")
+        .or_else(|| detail.get("reset_at"))
+        .and_then(|value| value.as_u64())
+        .map(|seconds| seconds.saturating_mul(1000))
+        .filter(|reset| *reset > now_ms());
+    if matches!(status_code.as_u16(), 403 | 429)
+        && [
+            "usage_limit_reached",
+            "usage limit",
+            "plan limit",
+            "limit reached on your plan",
+            "quota",
+            "usage cap",
+        ]
+        .iter()
+        .any(|signal| body_lower.contains(signal))
+    {
+        return AccountFailure::Quota(reset.unwrap_or(u64::MAX));
+    }
+    if status_code.as_u16() == 402
+        || (matches!(status_code.as_u16(), 403 | 429)
+            && ["billing", "no credit", "no_credit", "plan expired"]
+                .iter()
+                .any(|signal| body_lower.contains(signal)))
+    {
+        return AccountFailure::Billing;
+    }
+    if ["consent_required", "interaction_required", "login_required"]
+        .iter()
+        .any(|signal| body_lower.contains(signal))
+    {
+        return AccountFailure::NeedsReauth;
+    }
+    match status_code.as_u16() {
+        401 => AccountFailure::Unauthorized,
+        403 => AccountFailure::Scope(
+            detail
+                .get("required_scope")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    headers
+                        .get("www-authenticate")?
+                        .to_str()
+                        .ok()?
+                        .split("scope=\"")
+                        .nth(1)?
+                        .split('"')
+                        .next()
+                })
+                .filter(|scope| !scope.trim().is_empty())
+                .map(str::to_owned),
+        ),
+        429 => {
+            let delay = headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30);
+            AccountFailure::RateLimit(now_ms().saturating_add(delay.max(1).saturating_mul(1000)))
+        }
+        500..=599 => AccountFailure::Transient,
+        _ => AccountFailure::Other,
+    }
+}
+
+fn stream_event_error(event: &open_ai::responses::StreamEvent) -> Option<open_ai::RequestError> {
+    use open_ai::responses::StreamEvent;
+    let error = match event {
+        StreamEvent::Error { error } => error.clone(),
+        StreamEvent::Failed { response } => response.error.clone()?,
+        StreamEvent::GenericError { error } => error.clone().into_response_error(),
+        _ => return None,
+    };
+    let signal = format!(
+        "{} {} {}",
+        error.code.as_deref().unwrap_or_default(),
+        error.error_type.as_deref().unwrap_or_default(),
+        error.message
+    )
+    .to_ascii_lowercase();
+    let status = if ["invalid_token", "expired_token", "authentication"]
+        .iter()
+        .any(|code| signal.contains(code))
+    {
+        401
+    } else if ["billing", "no credit"]
+        .iter()
+        .any(|code| signal.contains(code))
+    {
+        402
+    } else if [
+        "scope",
+        "permission",
+        "consent",
+        "login_required",
+        "interaction_required",
+    ]
+    .iter()
+    .any(|code| signal.contains(code))
+    {
+        403
+    } else if ["limit", "quota", "slow_down"]
+        .iter()
+        .any(|code| signal.contains(code))
+    {
+        429
+    } else if ["server_error", "timeout", "overloaded"]
+        .iter()
+        .any(|code| signal.contains(code))
+    {
+        503
+    } else {
+        400
+    };
+    Some(open_ai::RequestError::HttpResponseError {
+        provider: PROVIDER_NAME.0.to_string(),
+        status_code: http_client::StatusCode::from_u16(status).ok()?,
+        body: serde_json::json!({ "error": error }).to_string(),
+        headers: Box::default(),
+    })
+}
+
+async fn preflight_stream(
+    mut stream: futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>,
+    cx: &AsyncApp,
+) -> Result<
+    futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>,
+    open_ai::RequestError,
+> {
+    use open_ai::responses::StreamEvent;
+    let mut buffered = Vec::new();
+    loop {
+        let timeout = cx.background_executor().timer(Duration::from_secs(60));
+        let event = futures::select! {
+            event = stream.next().fuse() => event,
+            () = timeout.fuse() => return Err(open_ai::RequestError::HttpSend { provider: PROVIDER_NAME.0.to_string(), host: "chatgpt.com".into(), error: anyhow!("Response stream timed out") }),
+        };
+        let Some(event) = event else {
+            return Ok(futures::stream::iter(buffered).boxed());
+        };
+        let event = event.map_err(open_ai::RequestError::Other)?;
+        if let Some(error) = stream_event_error(&event) {
+            return Err(error);
+        }
+        let metadata = matches!(
+            event,
+            StreamEvent::Created { .. } | StreamEvent::InProgress { .. } | StreamEvent::Unknown
+        );
+        buffered.push(Ok(event));
+        // Once output has started, replay could duplicate text or tool calls.
+        if !metadata || buffered.len() >= 32 {
+            return Ok(futures::stream::iter(buffered).chain(stream).boxed());
+        }
+    }
+}
+
+async fn record_account_failure(
+    state: &WeakEntity<State>,
+    id: &str,
+    model: &str,
+    token: &str,
+    failure: AccountFailure,
+    cx: &mut AsyncApp,
+) -> Result<(), LanguageModelCompletionError> {
+    let persist = state.update(cx, |state, cx| {
+        let Some(account) = state.accounts.accounts.get_mut(id) else {
+            return None;
+        };
+        if matches!(
+            failure,
+            AccountFailure::Unauthorized | AccountFailure::NeedsReauth
+        ) && account
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.access_token != token)
+        {
+            return None;
+        }
+        match failure {
+            AccountFailure::Unauthorized | AccountFailure::NeedsReauth => {
+                account.needs_reauth = true;
+                account.status = "Sign in again".into();
+            }
+            AccountFailure::Scope(_) => {
+                if !account
+                    .blocked_models
+                    .iter()
+                    .any(|blocked| blocked == model)
+                {
+                    account.blocked_models.push(model.to_owned());
+                }
+                account.status = format!("Missing permission for {model}");
+            }
+            AccountFailure::RateLimit(until) => {
+                account.unavailable_until_ms = account.unavailable_until_ms.max(until);
+                account.status = "Rate limited".into();
+            }
+            AccountFailure::Quota(until) => {
+                account.quota_until_ms = account.quota_until_ms.max(until);
+                account.status = "Plan quota reached".into();
+            }
+            AccountFailure::Billing => {
+                account.billing_blocked = true;
+                account.status = "Billing requires attention".into();
+            }
+            AccountFailure::Transient | AccountFailure::Other => return None,
+        }
+        cx.notify();
+        Some(state.persist(cx))
+    })?;
+    if let Some(persist) = persist {
+        persist.await.map_err(|error| anyhow!("{error}"))?;
+    }
+    Ok(())
+}
+
+fn monitor_account_stream(
+    state: WeakEntity<State>,
+    http_client: Arc<dyn HttpClient>,
+    id: String,
+    model: String,
+    token: String,
+    mut stream: futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>,
+    cx: &AsyncApp,
+) -> futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>> {
+    let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+    let task = cx.spawn(async move |cx| {
+        loop {
+            let timeout = cx.background_executor().timer(Duration::from_secs(60));
+            let event = futures::select! {
+                event = stream.next().fuse() => event,
+                () = timeout.fuse() => {
+                    if sender.send(Err(anyhow!("ChatGPT response stream timed out"))).await.is_err() { return; }
+                    break;
+                }
+            };
+            let Some(event) = event else { break; };
+            let failure = event
+                .as_ref()
+                .ok()
+                .and_then(stream_event_error)
+                .map(|error| classify_failure(&error));
+            let failed = event.is_err() || failure.is_some();
+            if let Some(failure) = failure {
+                let result = if failure == AccountFailure::Unauthorized {
+                    account_credentials(&state, &http_client, &id, Some(&token), cx)
+                        .await
+                        .map(|_| ())
+                } else {
+                    record_account_failure(&state, &id, &model, &token, failure, cx).await
+                };
+                if let Err(error) = result {
+                    if sender.send(Err(anyhow!("{error}"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            if sender.send(event).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    futures::stream::unfold((receiver, task), |(mut receiver, task)| async move {
+        receiver.next().await.map(|event| (event, (receiver, task)))
+    })
+    .boxed()
+}
+
+async fn stream_with_accounts(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    request: &open_ai::responses::Request,
+    preferred: Option<&str>,
+    cx: &mut AsyncApp,
+) -> Result<
+    futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>,
+    LanguageModelCompletionError,
+> {
+    let (mut candidates, policy) = state.read_with(cx, |state, _| {
+        let preferred = preferred.unwrap_or(&state.accounts.selected);
+        let mut candidates = vec![preferred.to_owned()];
+        if state.switch_policy() == AccountSwitchPolicy::OnError {
+            candidates.extend(
+                state
+                    .accounts
+                    .accounts
+                    .keys()
+                    .filter(|id| id.as_str() != preferred)
+                    .cloned(),
+            );
+        }
+        (candidates, state.switch_policy())
+    })?;
+    let mut last_error = None;
+    let mut required_scope: Option<String> = None;
+    for id in candidates.drain(..) {
+        let eligible = state.read_with(cx, |state, _| {
+            state.accounts.accounts.get(&id).is_some_and(|account| {
+                account.available(&request.model)
+                    && required_scope.as_ref().is_none_or(|scope| {
+                        account.credentials.as_ref().is_some_and(|credentials| {
+                            scope.split_whitespace().all(|required| {
+                                credentials.scopes.iter().any(|granted| granted == required)
+                            })
+                        })
+                    })
+            })
+        })?;
+        if !eligible {
+            continue;
+        }
+        let mut credentials = match account_credentials(state, http_client, &id, None, cx).await {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let mut refreshed = false;
+        let mut retried = false;
+        loop {
+            let headers = codex_extra_headers(&credentials, request.prompt_cache_key.as_deref());
+            let provider_name = PROVIDER_NAME;
+            let response = stream_response_ref(
+                http_client.as_ref(),
+                provider_name.0.as_str(),
+                CODEX_BASE_URL,
+                &credentials.access_token,
+                request,
+                &headers,
+            );
+            let timeout = cx.background_executor().timer(Duration::from_secs(60));
+            let result = futures::select! {
+                response = response.fuse() => response,
+                () = timeout.fuse() => Err(open_ai::RequestError::HttpSend { provider: PROVIDER_NAME.0.to_string(), host: "chatgpt.com".into(), error: anyhow!("Request timed out") }),
+            };
+            let result = match result {
+                Ok(stream) => preflight_stream(stream, cx).await,
+                Err(error) => Err(error),
+            };
+            let error = match result {
+                Ok(stream) => {
+                    return Ok(monitor_account_stream(
+                        state.clone(),
+                        http_client.clone(),
+                        id,
+                        request.model.clone(),
+                        credentials.access_token,
+                        stream,
+                        cx,
+                    ));
+                }
+                Err(error) => error,
+            };
+            let failure = classify_failure(&error);
+            if failure == AccountFailure::Unauthorized && !refreshed {
+                refreshed = true;
+                match account_credentials(
+                    state,
+                    http_client,
+                    &id,
+                    Some(&credentials.access_token),
+                    cx,
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        credentials = fresh;
+                        continue;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if failure == AccountFailure::Transient && !retried {
+                retried = true;
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                continue;
+            }
+            let can_failover = match &failure {
+                AccountFailure::Other => false,
+                AccountFailure::Scope(scope) => {
+                    required_scope = scope.clone();
+                    scope.is_some()
+                }
+                _ => true,
+            };
+            record_account_failure(
+                state,
+                &id,
+                &request.model,
+                &credentials.access_token,
+                failure,
+                cx,
+            )
+            .await?;
+            if !can_failover || policy == AccountSwitchPolicy::Manual {
+                return Err(error.into());
+            }
+            last_error = Some(error.into());
+            break;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "No eligible ChatGPT account. Check account status in Settings > AI > LLM Providers."
+        )
+        .into()
+    }))
+}
+
 async fn get_fresh_credentials(
     state: &WeakEntity<State>,
     http_client: &Arc<dyn HttpClient>,
     cx: &mut AsyncApp,
 ) -> Result<CodexCredentials, LanguageModelCompletionError> {
-    let (creds, existing_task) = state
-        .read_with(&*cx, |s, _| (s.credentials.clone(), s.refresh_task.clone()))
-        .map_err(LanguageModelCompletionError::Other)?;
+    let id = state.read_with(cx, |state, _| state.accounts.selected.clone())?;
+    account_credentials(state, http_client, &id, None, cx).await
+}
 
-    let creds = creds.ok_or(LanguageModelCompletionError::NoApiKey {
+async fn refresh_with_timeout(
+    http_client: &Arc<dyn HttpClient>,
+    refresh_token_value: &str,
+    cx: &AsyncApp,
+) -> Result<CodexCredentials, RefreshError> {
+    let timeout = cx.background_executor().timer(Duration::from_secs(60));
+    futures::select! {
+        result = refresh_token(http_client, refresh_token_value).fuse() => result,
+        () = timeout.fuse() => Err(RefreshError::Transient(anyhow!("ChatGPT token refresh timed out"))),
+    }
+}
+
+async fn account_credentials(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    id: &str,
+    rejected_token: Option<&str>,
+    cx: &mut AsyncApp,
+) -> Result<CodexCredentials, LanguageModelCompletionError> {
+    let (credentials, existing_task) = state.read_with(cx, |state, _| {
+        (
+            state
+                .accounts
+                .accounts
+                .get(id)
+                .filter(|account| !account.needs_reauth)
+                .and_then(|account| account.credentials.clone()),
+            state.refresh_tasks.get(id).cloned(),
+        )
+    })?;
+    let credentials = credentials.ok_or(LanguageModelCompletionError::NoApiKey {
         provider: PROVIDER_NAME,
     })?;
-
-    if !creds.is_expired() {
-        return Ok(creds);
+    if let Some(task) = existing_task {
+        return task.await.map_err(|error| anyhow!("{error}").into());
     }
-
-    // If another caller is already refreshing, await their result.
-    if let Some(shared_task) = existing_task {
-        return shared_task
-            .await
-            .map_err(|e| LanguageModelCompletionError::Other(anyhow::anyhow!("{e}")));
+    if !credentials.is_expired() && rejected_token != Some(credentials.access_token.as_str()) {
+        return Ok(credentials);
     }
-
-    // We are the first caller to notice expiry — spawn the refresh task.
-    let http_client_clone = http_client.clone();
+    let http_client = http_client.clone();
+    let id = id.to_owned();
+    let account_id = id.clone();
     let state_clone = state.clone();
-    let refresh_token_value = creds.refresh_token.clone();
-
-    // Capture the generation so we can detect sign-outs that happened during refresh.
-    let generation = state
-        .read_with(&*cx, |s, _| s.auth_generation)
-        .map_err(LanguageModelCompletionError::Other)?;
-
-    let shared_task = cx
+    let task = cx
         .spawn(async move |cx| {
-            let result = refresh_token(&http_client_clone, &refresh_token_value).await;
-
-            match result {
-                Ok(refreshed) => {
-                    let persist_result: Result<CodexCredentials, Arc<anyhow::Error>> = async {
-                        // Check if auth_generation changed (sign-out during refresh).
-                        let current_generation = state_clone
-                            .read_with(&*cx, |s, _| s.auth_generation)
-                            .map_err(|e| Arc::new(e))?;
-                        if current_generation != generation {
-                            return Err(Arc::new(anyhow!(
-                                "Sign-out occurred during token refresh"
-                            )));
+            let result = match refresh_with_timeout(&http_client, &credentials.refresh_token, cx)
+                .await
+            {
+                Err(RefreshError::Transient(error)) => {
+                    log::warn!("Retrying ChatGPT token refresh after a transient failure: {error}");
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    refresh_with_timeout(&http_client, &credentials.refresh_token, cx).await
+                }
+                result => result,
+            };
+            let (result, persist) = state_clone
+                .update(cx, |state, cx| {
+                    let Some(account) = state.accounts.accounts.get_mut(&account_id) else {
+                        return (Err(Arc::new(anyhow!("Account was removed"))), None);
+                    };
+                    if account.credentials.as_ref().is_none_or(|current| {
+                        current.refresh_token != credentials.refresh_token
+                            || current.access_token != credentials.access_token
+                    }) {
+                        return (
+                            Err(Arc::new(anyhow!("Account changed during token refresh"))),
+                            None,
+                        );
+                    }
+                    state.refresh_tasks.remove(&account_id);
+                    let result = match result {
+                        Ok(mut refreshed) => {
+                            if refreshed
+                                .account_id
+                                .as_ref()
+                                .zip(credentials.account_id.as_ref())
+                                .is_some_and(|(new, previous)| new != previous)
+                            {
+                                account.needs_reauth = true;
+                                account.status =
+                                    "Account changed during refresh. Sign in again".into();
+                                return (
+                                    Err(Arc::new(anyhow!(
+                                        "Token refresh returned a different ChatGPT account"
+                                    ))),
+                                    Some(state.persist(cx)),
+                                );
+                            }
+                            refreshed.account_id = refreshed.account_id.or(credentials.account_id);
+                            refreshed.email = refreshed.email.or(credentials.email);
+                            if refreshed.scopes.is_empty() {
+                                refreshed.scopes = credentials.scopes;
+                            }
+                            account.credentials = Some(refreshed.clone());
+                            Ok(refreshed)
                         }
-
-                        let credentials_provider = state_clone
-                            .read_with(&*cx, |s, _| s.credentials_provider.clone())
-                            .map_err(|e| Arc::new(e))?;
-
-                        let json =
-                            serde_json::to_vec(&refreshed).map_err(|e| Arc::new(e.into()))?;
-
-                        credentials_provider
-                            .write_credentials(CREDENTIALS_KEY, "Bearer", &json, &*cx)
-                            .await
-                            .map_err(|e| Arc::new(e))?;
-
-                        state_clone
-                            .update(cx, |s, _| {
-                                s.credentials = Some(refreshed.clone());
-                                s.refresh_task = None;
-                            })
-                            .map_err(|e| Arc::new(e))?;
-
-                        Ok(refreshed)
-                    }
-                    .await;
-
-                    // Clear refresh_task on failure too.
-                    if persist_result.is_err() {
-                        state_clone
-                            .update(cx, |s, _| {
-                                s.refresh_task = None;
-                            })
-                            .ok();
-                    }
-
-                    persist_result
-                }
-                Err(RefreshError::Fatal(e)) => {
-                    log::error!("ChatGPT subscription token refresh failed fatally: {e:?}");
-                    state_clone
-                        .update(cx, |s, cx| {
-                            s.refresh_task = None;
-                            s.credentials = None;
-                            s.last_auth_error =
+                        Err(RefreshError::Fatal(error)) => {
+                            account.needs_reauth = true;
+                            account.status = "Sign in again".into();
+                            state.last_auth_error =
                                 Some("Your session has expired. Please sign in again.".into());
-                            s.reset_model_catalog();
-                            cx.notify();
-                        })
-                        .ok();
-                    // Also clear the keychain so stale credentials aren't loaded next time.
-                    if let Ok(credentials_provider) =
-                        state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
-                    {
-                        credentials_provider
-                            .delete_credentials(CREDENTIALS_KEY, &*cx)
-                            .await
-                            .log_err();
-                    }
-                    Err(Arc::new(e))
-                }
-                Err(RefreshError::Transient(e)) => {
-                    log::warn!("ChatGPT subscription token refresh failed transiently: {e:?}");
-                    state_clone
-                        .update(cx, |s, _| {
-                            s.refresh_task = None;
-                        })
-                        .ok();
-                    Err(Arc::new(e))
-                }
+                            Err(Arc::new(error))
+                        }
+                        Err(RefreshError::Transient(error)) => return (Err(Arc::new(error)), None),
+                    };
+                    cx.notify();
+                    (result, Some(state.persist(cx)))
+                })
+                .map_err(Arc::new)?;
+            if let Some(persist) = persist {
+                persist.await?;
             }
+            result
         })
         .shared();
-
-    // Store the shared task so concurrent callers can join on it.
-    state
-        .update(cx, |s, _| {
-            s.refresh_task = Some(shared_task.clone());
-        })
-        .map_err(LanguageModelCompletionError::Other)?;
-
-    shared_task
-        .await
-        .map_err(|e| LanguageModelCompletionError::Other(anyhow::anyhow!("{e}")))
+    state.update(cx, |state, _| {
+        state.refresh_tasks.insert(id, task.clone());
+    })?;
+    task.await.map_err(|error| anyhow!("{error}").into())
 }
 
 #[derive(Deserialize)]
 struct TokenResponse {
+    #[serde(default)]
+    scope: Option<String>,
     access_token: String,
     refresh_token: String,
     #[serde(default)]
@@ -1156,6 +1885,7 @@ async fn do_oauth_flow(
         // Windows Credential Manager's 2560-byte blob limit
         // (CRED_MAX_CREDENTIAL_BLOB_SIZE). See #58541.
         .append_pair("scope", "openid profile email offline_access")
+        .append_pair("prompt", "select_account")
         .append_pair("response_type", "code")
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
@@ -1190,6 +1920,12 @@ async fn do_oauth_flow(
 
     Ok(CodexCredentials {
         access_token: tokens.access_token,
+        scopes: tokens
+            .scope
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
         refresh_token: tokens.refresh_token,
         expires_at_ms: now_ms() + tokens.expires_in * 1000,
         account_id: claims.account_id,
@@ -1281,6 +2017,12 @@ async fn refresh_token(
 
     Ok(CodexCredentials {
         access_token: tokens.access_token,
+        scopes: tokens
+            .scope
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
         refresh_token: tokens.refresh_token,
         expires_at_ms: now_ms() + tokens.expires_in * 1000,
         account_id: claims.account_id,
@@ -1362,6 +2104,551 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_account_failure_classification() {
+        for (status, body, expected) in [
+            (401, "invalid_token", AccountFailure::Unauthorized),
+            (401, "interaction_required", AccountFailure::NeedsReauth),
+            (403, "insufficient_scope", AccountFailure::Scope(None)),
+            (
+                429,
+                "limit reached on your plan",
+                AccountFailure::Quota(u64::MAX),
+            ),
+            (403, "usage_limit_reached", AccountFailure::Quota(u64::MAX)),
+            (402, "payment required", AccountFailure::Billing),
+            (500, "server error", AccountFailure::Transient),
+            (400, "bad request", AccountFailure::Other),
+        ] {
+            let error = open_ai::RequestError::HttpResponseError {
+                provider: "test".into(),
+                status_code: http_client::StatusCode::from_u16(status).expect("valid status"),
+                body: body.into(),
+                headers: Box::default(),
+            };
+            assert_eq!(classify_failure(&error), expected, "{status}: {body}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_credentials_and_quota_round_trip() {
+        let legacy = serde_json::to_vec(&make_fresh_credentials()).expect("serialize");
+        let mut accounts = Accounts::decode(&legacy).expect("legacy credentials migrate");
+        assert_eq!(accounts.accounts.len(), 1);
+        let account = accounts
+            .accounts
+            .get_mut(&accounts.selected)
+            .expect("account");
+        account.quota_until_ms = u64::MAX;
+        let encoded = serde_json::to_vec(&accounts).expect("serialize accounts");
+        let restored = Accounts::decode(&encoded).expect("restore accounts");
+        assert!(
+            !restored
+                .accounts
+                .get(&restored.selected)
+                .expect("account")
+                .available("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn test_sse_quota_reset_time_is_preserved() {
+        let reset_seconds = now_ms() / 1000 + 3600;
+        let event = serde_json::from_value::<open_ai::responses::StreamEvent>(serde_json::json!({
+            "type": "error", "error": { "code": "usage_limit_reached", "message": "Plan quota", "resets_at": reset_seconds }
+        })).expect("event");
+        let error = stream_event_error(&event).expect("error");
+        assert_eq!(
+            classify_failure(&error),
+            AccountFailure::Quota(reset_seconds * 1000)
+        );
+    }
+
+    #[gpui::test(iterations = 20)]
+    async fn test_accounts_refresh_independently(cx: &mut TestAppContext) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create({
+            let calls = calls.clone();
+            move |mut request| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let mut body = String::new();
+                    smol::io::AsyncReadExt::read_to_string(request.body_mut(), &mut body).await?;
+                    let token = if body.contains("first_refresh") {
+                        "first_access"
+                    } else {
+                        "second_access"
+                    };
+                    let mut response: serde_json::Value =
+                        serde_json::from_str(&fake_token_response())?;
+                    response["access_token"] = token.into();
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(response.to_string()))?)
+                }
+            }
+        });
+        let provider = Arc::new(FakeCredentialsProvider::new());
+        let mut credentials = make_expired_credentials();
+        credentials.account_id = Some("first".into());
+        credentials.refresh_token = "first_refresh".into();
+        let state = make_state_with_credentials_provider(
+            http.clone(),
+            Some(credentials),
+            provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            let mut credentials = make_expired_credentials();
+            credentials.account_id = Some("second".into());
+            credentials.refresh_token = "second_refresh".into();
+            state.accounts.insert(credentials);
+        });
+        let first = cx.spawn({
+            let state = state.downgrade();
+            let http = http.clone();
+            async move |mut cx| account_credentials(&state, &http, "first", None, &mut cx).await
+        });
+        let second = cx.spawn({
+            let state = state.downgrade();
+            async move |mut cx| account_credentials(&state, &http, "second", None, &mut cx).await
+        });
+        assert_eq!(
+            first.await.expect("first refresh").access_token,
+            "first_access"
+        );
+        assert_eq!(
+            second.await.expect("second refresh").access_token,
+            "second_access"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let restored = load_accounts(provider.as_ref(), &cx.to_async())
+            .await
+            .expect("load");
+        for (id, expected) in [("first", "first_access"), ("second", "second_access")] {
+            assert_eq!(
+                restored
+                    .accounts
+                    .get(id)
+                    .expect("account")
+                    .credentials
+                    .as_ref()
+                    .expect("credentials")
+                    .access_token,
+                expected
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_thread_account_binding_does_not_change_other_models(cx: &mut TestAppContext) {
+        let http = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from("data: [DONE]\n\n"))?)
+        });
+        let mut credentials = make_fresh_credentials();
+        credentials.account_id = Some("first".into());
+        let state = make_state(http, Some(credentials), cx);
+        state.update(cx, |state, _| {
+            let mut credentials = make_fresh_credentials();
+            credentials.account_id = Some("second".into());
+            state.accounts.insert(credentials);
+            state.accounts.selected = "first".into();
+        });
+        let model = cx.read(|cx| create_language_model(ChatGptModel::Gpt54, &state, cx));
+        let second = model
+            .with_account("second".into())
+            .expect("account binding");
+        cx.read(|cx| {
+            assert!(
+                model
+                    .accounts(cx)
+                    .iter()
+                    .any(|account| account.id == "first" && account.selected)
+            );
+            assert!(
+                second
+                    .accounts(cx)
+                    .iter()
+                    .any(|account| account.id == "second" && account.selected)
+            );
+            assert_eq!(state.read(cx).accounts.selected, "first");
+        });
+        assert_eq!(second.account_id(), Some("second"));
+        assert_eq!(model.account_id(), None);
+    }
+
+    #[gpui::test]
+    async fn test_account_failover_signals_and_manual_policy(cx: &mut TestAppContext) {
+        for (status, body, policy, expected) in [
+            (
+                401,
+                "invalid_token",
+                AccountSwitchPolicy::OnError,
+                vec!["first", "refresh", "second"],
+            ),
+            (
+                429,
+                "rate_limit_exceeded",
+                AccountSwitchPolicy::OnError,
+                vec!["first", "second"],
+            ),
+            (
+                402,
+                "billing",
+                AccountSwitchPolicy::OnError,
+                vec!["first", "second"],
+            ),
+            (
+                503,
+                "overloaded",
+                AccountSwitchPolicy::OnError,
+                vec!["first", "first", "second"],
+            ),
+            (
+                403,
+                "insufficient_scope",
+                AccountSwitchPolicy::OnError,
+                vec!["first"],
+            ),
+            (
+                403,
+                r#"{"error":{"code":"insufficient_scope","required_scope":"responses.write"}}"#,
+                AccountSwitchPolicy::OnError,
+                vec!["first", "second"],
+            ),
+            (
+                429,
+                "rate_limit_exceeded",
+                AccountSwitchPolicy::Manual,
+                vec!["first"],
+            ),
+            (
+                400,
+                "invalid_request",
+                AccountSwitchPolicy::OnError,
+                vec!["first"],
+            ),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let http = FakeHttpClient::create({
+                let calls = calls.clone();
+                move |request| {
+                    let calls = calls.clone();
+                    async move {
+                        if request.uri().path() == "/oauth/token" {
+                            calls.lock().push("refresh".to_owned());
+                            return Ok(http_client::Response::builder()
+                                .status(400)
+                                .body(AsyncBody::from("invalid_grant"))?);
+                        }
+                        let account = request
+                            .headers()
+                            .get("chatgpt-account-id")
+                            .expect("account header")
+                            .to_str()?
+                            .to_owned();
+                        calls.lock().push(account.clone());
+                        Ok(http_client::Response::builder()
+                            .status(if account == "first" { status } else { 200 })
+                            .body(AsyncBody::from(if account == "first" {
+                                body
+                            } else {
+                                "data: [DONE]\n\n"
+                            }))?)
+                    }
+                }
+            });
+            let mut credentials = make_fresh_credentials();
+            credentials.account_id = Some("first".into());
+            let state = make_state(http, Some(credentials), cx);
+            state.update(cx, |state, _| {
+                let mut second = make_fresh_credentials();
+                second.account_id = Some("second".into());
+                second.scopes = vec!["responses.write".into()];
+                state.accounts.insert(second);
+                state.accounts.selected = "first".into();
+                state.configured_policy = Some(policy);
+            });
+            let model = cx.read(|cx| create_language_model(ChatGptModel::Gpt54, &state, cx));
+            let result = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                expected.last() == Some(&"second"),
+                "{status}: {body}"
+            );
+            drop(result);
+            assert_eq!(*calls.lock(), expected, "{status}: {body}");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_sse_quota_failure_uses_other_account(cx: &mut TestAppContext) {
+        for partial_output in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let http = FakeHttpClient::create({
+                let calls = calls.clone();
+                move |request| {
+                    let calls = calls.clone();
+                    async move {
+                        let account = request
+                            .headers()
+                            .get("chatgpt-account-id")
+                            .expect("account header")
+                            .to_str()?
+                            .to_owned();
+                        calls.lock().push(account.clone());
+                        let body = if account == "first" {
+                            "data: {\"type\":\"response.created\",\"response\":{}}\n\ndata: {\"type\":\"error\",\"error\":{\"code\":\"usage_limit_reached\",\"message\":\"limit reached on your plan\"}}\n\n"
+                        } else {
+                            "data: [DONE]\n\n"
+                        };
+                        let body = if account == "first" && partial_output {
+                            format!(
+                                "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"message\",\"output_index\":0,\"delta\":\"Hello\"}}\n\n{body}"
+                            )
+                        } else {
+                            body.to_owned()
+                        };
+                        Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(body))?)
+                    }
+                }
+            });
+            let mut credentials = make_fresh_credentials();
+            credentials.account_id = Some("first".into());
+            let state = make_state(http, Some(credentials), cx);
+            state.update(cx, |state, _| {
+                let mut second = make_fresh_credentials();
+                second.account_id = Some("second".into());
+                state.accounts.insert(second);
+                state.accounts.selected = "first".into();
+            });
+            let model = cx.read(|cx| create_language_model(ChatGptModel::Gpt54, &state, cx));
+            let stream = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .expect("SSE failure should fail over");
+            if partial_output {
+                let events = stream.collect::<Vec<_>>().await;
+                assert!(events.iter().any(Result::is_err));
+                assert_eq!(*calls.lock(), vec!["first"], "do not replay partial output");
+                drop(
+                    model
+                        .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                        .await
+                        .expect("next request uses other account"),
+                );
+            } else {
+                drop(stream);
+            }
+            assert_eq!(*calls.lock(), vec!["first", "second"]);
+            cx.read(|cx| {
+                assert_eq!(
+                    state
+                        .read(cx)
+                        .accounts
+                        .accounts
+                        .get("first")
+                        .expect("first")
+                        .quota_until_ms,
+                    u64::MAX
+                )
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_accounts_use_separate_credential_records(cx: &mut TestAppContext) {
+        let provider = Arc::new(FakeCredentialsProvider::new());
+        let mut accounts = Accounts::default();
+        for id in ["first", "second"] {
+            let mut credentials = make_fresh_credentials();
+            credentials.account_id = Some(id.into());
+            credentials.access_token = "a".repeat(1800);
+            accounts.insert(credentials);
+        }
+        let first = accounts.accounts.get_mut("first").expect("first");
+        first.quota_until_ms = u64::MAX;
+        first.status = "Plan quota reached".into();
+        save_accounts(provider.as_ref(), &accounts, &cx.to_async())
+            .await
+            .expect("save");
+        assert_eq!(provider.account_storage.lock().len(), 2);
+        assert!(
+            provider
+                .account_storage
+                .lock()
+                .values()
+                .all(|(_, bytes)| bytes.len() <= 2560)
+        );
+        let restored = load_accounts(provider.as_ref(), &cx.to_async())
+            .await
+            .expect("load");
+        assert_eq!(restored.accounts.len(), 2);
+        assert!(
+            !restored
+                .accounts
+                .get("first")
+                .expect("first")
+                .available("gpt-5.4")
+        );
+        assert!(
+            restored
+                .accounts
+                .get("second")
+                .expect("second")
+                .available("gpt-5.4")
+        );
+        let mut restored = restored;
+        let credentials = restored
+            .accounts
+            .get("first")
+            .expect("first")
+            .credentials
+            .clone()
+            .expect("credentials");
+        let first = restored.accounts.get_mut("first").expect("first");
+        first.needs_reauth = true;
+        first.status = "Sign in again".into();
+        restored.insert(credentials);
+        assert!(
+            !restored
+                .accounts
+                .get("first")
+                .expect("first")
+                .available("gpt-5.4"),
+            "reauth must not clear quota"
+        );
+        restored.accounts.remove("first");
+        save_accounts(provider.as_ref(), &restored, &cx.to_async())
+            .await
+            .expect("remove");
+        assert_eq!(provider.account_storage.lock().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_unauthorized_refreshes_same_account_before_failover(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let http = FakeHttpClient::create({
+            let calls = calls.clone();
+            move |request| {
+                let calls = calls.clone();
+                async move {
+                    if request.uri().path() == "/oauth/token" {
+                        calls.lock().push("refresh".to_owned());
+                        return Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(fake_token_response()))?);
+                    }
+                    let account = request
+                        .headers()
+                        .get("chatgpt-account-id")
+                        .expect("account header")
+                        .to_str()?
+                        .to_owned();
+                    calls.lock().push(account.clone());
+                    Ok(http_client::Response::builder()
+                        .status(if account == "first" { 401 } else { 200 })
+                        .body(AsyncBody::from(if account == "first" {
+                            "invalid_token"
+                        } else {
+                            "data: [DONE]\n\n"
+                        }))?)
+                }
+            }
+        });
+        let mut credentials = make_fresh_credentials();
+        credentials.account_id = Some("first".into());
+        let state = make_state(http, Some(credentials), cx);
+        state.update(cx, |state, _| {
+            let mut second = make_fresh_credentials();
+            second.account_id = Some("second".into());
+            state.accounts.insert(second);
+            state.accounts.selected = "first".into();
+        });
+        let model = cx.read(|cx| create_language_model(ChatGptModel::Gpt54, &state, cx));
+        let stream = model
+            .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+            .await
+            .expect("failover succeeds");
+        drop(stream);
+        assert_eq!(*calls.lock(), vec!["first", "refresh", "first", "second"]);
+        cx.read(|cx| {
+            assert!(
+                state
+                    .read(cx)
+                    .accounts
+                    .accounts
+                    .get("first")
+                    .expect("first")
+                    .needs_reauth
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn test_plan_quota_freezes_account_across_requests(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let http = FakeHttpClient::create({
+            let calls = calls.clone();
+            move |request| {
+                let calls = calls.clone();
+                async move {
+                    let account = request
+                        .headers()
+                        .get("chatgpt-account-id")
+                        .expect("account header")
+                        .to_str()?
+                        .to_owned();
+                    calls.lock().push(account.clone());
+                    Ok(http_client::Response::builder()
+                        .status(if account == "first" { 429 } else { 200 })
+                        .body(AsyncBody::from(if account == "first" {
+                            "limit reached on your plan"
+                        } else {
+                            "data: [DONE]\n\n"
+                        }))?)
+                }
+            }
+        });
+        let mut credentials = make_fresh_credentials();
+        credentials.account_id = Some("first".into());
+        let state = make_state(http, Some(credentials), cx);
+        state.update(cx, |state, _| {
+            let mut second = make_fresh_credentials();
+            second.account_id = Some("second".into());
+            state.accounts.insert(second);
+            state.accounts.selected = "first".into();
+        });
+        let model = cx.read(|cx| create_language_model(ChatGptModel::Gpt54, &state, cx));
+        for _ in 0..2 {
+            let stream = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .expect("failover succeeds");
+            drop(stream);
+        }
+        assert_eq!(*calls.lock(), vec!["first", "second", "second"]);
+        cx.read(|cx| {
+            assert_eq!(
+                state
+                    .read(cx)
+                    .accounts
+                    .accounts
+                    .get("first")
+                    .expect("first")
+                    .quota_until_ms,
+                u64::MAX
+            )
+        });
+    }
 
     #[gpui::test]
     async fn test_concurrent_refresh_deduplicates(cx: &mut TestAppContext) {
@@ -1497,7 +2784,7 @@ mod tests {
         cx.read(|cx| {
             let s = state.read(cx);
             assert!(
-                s.credentials.is_none(),
+                !s.is_authenticated(),
                 "credentials should be cleared on fatal refresh failure"
             );
             assert!(
@@ -1532,7 +2819,7 @@ mod tests {
         cx.read(|cx| {
             let s = state.read(cx);
             assert!(
-                s.credentials.is_some(),
+                s.is_authenticated(),
                 "credentials should be kept on transient refresh failure"
             );
             assert!(
@@ -1669,7 +2956,7 @@ mod tests {
         cx.read(|cx| {
             let s = state.read(cx);
             assert!(
-                s.credentials.is_none(),
+                !s.is_authenticated(),
                 "sign-out should have cleared credentials"
             );
         });
@@ -2265,12 +3552,14 @@ mod tests {
 
     struct FakeCredentialsProvider {
         storage: Mutex<Option<(String, Vec<u8>)>>,
+        account_storage: Mutex<BTreeMap<String, (String, Vec<u8>)>>,
     }
 
     impl FakeCredentialsProvider {
         fn new() -> Self {
             Self {
                 storage: Mutex::new(None),
+                account_storage: Mutex::new(BTreeMap::new()),
             }
         }
     }
@@ -2278,31 +3567,47 @@ mod tests {
     impl CredentialsProvider for FakeCredentialsProvider {
         fn read_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-            Box::pin(async { Ok(self.storage.lock().clone()) })
+            Box::pin(async move {
+                Ok(if url == CREDENTIALS_KEY {
+                    self.storage.lock().clone()
+                } else {
+                    self.account_storage.lock().get(url).cloned()
+                })
+            })
         }
 
         fn write_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             username: &'a str,
             password: &'a [u8],
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            self.storage
-                .lock()
-                .replace((username.to_string(), password.to_vec()));
+            if url == CREDENTIALS_KEY {
+                self.storage
+                    .lock()
+                    .replace((username.to_owned(), password.to_vec()));
+            } else {
+                self.account_storage
+                    .lock()
+                    .insert(url.to_owned(), (username.to_owned(), password.to_vec()));
+            }
             Box::pin(async { Ok(()) })
         }
 
         fn delete_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            *self.storage.lock() = None;
+            if url == CREDENTIALS_KEY {
+                *self.storage.lock() = None;
+            } else {
+                self.account_storage.lock().remove(url);
+            }
             Box::pin(async { Ok(()) })
         }
     }
@@ -2327,9 +3632,18 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> Entity<State> {
         cx.new(|_cx| State {
-            credentials,
+            accounts: {
+                let mut accounts = Accounts::default();
+                if let Some(credentials) = credentials {
+                    accounts.insert(credentials);
+                }
+                accounts
+            },
+            usage_requests: BTreeMap::new(),
+            configured_policy: None,
+            persistence_task: None,
             sign_in_state: SignInState::Idle,
-            refresh_task: None,
+            refresh_tasks: BTreeMap::new(),
             load_task: None,
             credentials_provider,
             http_client,
@@ -2346,6 +3660,7 @@ mod tests {
         CodexCredentials {
             access_token: "old_access".to_string(),
             refresh_token: "old_refresh".to_string(),
+            scopes: Vec::new(),
             expires_at_ms: 0,
             account_id: None,
             email: None,
@@ -2356,6 +3671,7 @@ mod tests {
         CodexCredentials {
             access_token: "fresh_access".to_string(),
             refresh_token: "fresh_refresh".to_string(),
+            scopes: Vec::new(),
             expires_at_ms: now_ms() + 3_600_000,
             account_id: None,
             email: None,

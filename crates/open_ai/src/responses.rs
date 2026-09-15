@@ -391,6 +391,10 @@ pub enum CustomToolGrammarSyntax {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResponseError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_scope: Option<String>,
     #[serde(default)]
     pub code: Option<String>,
     #[serde(default, rename = "type")]
@@ -415,6 +419,10 @@ pub struct GenericStreamErrorPayload {
 #[derive(Deserialize, Debug, Clone, Default)]
 struct PartialResponseError {
     #[serde(default)]
+    resets_at: Option<u64>,
+    #[serde(default)]
+    required_scope: Option<String>,
+    #[serde(default)]
     code: Option<String>,
     #[serde(default, rename = "type")]
     error_type: Option<String>,
@@ -428,6 +436,8 @@ impl GenericStreamErrorPayload {
     pub fn into_response_error(self) -> ResponseError {
         let nested = self.error.unwrap_or_default();
         ResponseError {
+            resets_at: self.top_level.resets_at.or(nested.resets_at),
+            required_scope: self.top_level.required_scope.or(nested.required_scope),
             code: self.top_level.code.or(nested.code),
             error_type: self.top_level.error_type.or(nested.error_type),
             message: self
@@ -782,6 +792,25 @@ pub async fn stream_response(
     api_url: &str,
     api_key: &str,
     request: Request,
+    extra_headers: &CustomHeaders,
+) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    stream_response_ref(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        &request,
+        extra_headers,
+    )
+    .await
+}
+
+pub async fn stream_response_ref(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: &Request,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
     let uri = format!("{api_url}/responses");

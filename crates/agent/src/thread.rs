@@ -1234,7 +1234,7 @@ enum CompletionError {
 
 pub enum ThreadModel {
     Ready(Arc<dyn LanguageModel>),
-    Unresolved(SelectedModel),
+    Unresolved(SelectedModel, Option<String>),
     Unset,
 }
 
@@ -1242,7 +1242,7 @@ impl ThreadModel {
     fn as_model(&self) -> Option<&Arc<dyn LanguageModel>> {
         match self {
             Self::Ready(model) => Some(model),
-            Self::Unresolved(_) | Self::Unset => None,
+            Self::Unresolved(..) | Self::Unset => None,
         }
     }
 }
@@ -1251,10 +1251,12 @@ impl From<&ThreadModel> for Option<DbLanguageModel> {
     fn from(model: &ThreadModel) -> Self {
         match model {
             ThreadModel::Ready(model) => Some(DbLanguageModel {
+                account_id: model.account_id().map(str::to_owned),
                 provider: model.provider_id().to_string(),
                 model: model.id().0.to_string(),
             }),
-            ThreadModel::Unresolved(selection) => Some(DbLanguageModel {
+            ThreadModel::Unresolved(selection, account_id) => Some(DbLanguageModel {
+                account_id: account_id.clone(),
                 provider: selection.provider.0.to_string(),
                 model: selection.model.0.to_string(),
             }),
@@ -1411,7 +1413,9 @@ impl Thread {
         let model = match model {
             Some(model) => ThreadModel::Ready(model),
             None => Self::user_configured_model_selection(cx)
-                .map_or(ThreadModel::Unset, ThreadModel::Unresolved),
+                .map_or(ThreadModel::Unset, |selection| {
+                    ThreadModel::Unresolved(selection, None)
+                }),
         };
         Self {
             id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
@@ -1764,6 +1768,10 @@ impl Thread {
             .profile
             .unwrap_or_else(|| settings.default_profile.clone());
 
+        let saved_account_id = db_thread
+            .model
+            .as_ref()
+            .and_then(|model| model.account_id.clone());
         let saved_selection = db_thread.model.map(|model| SelectedModel {
             provider: model.provider.into(),
             model: model.model.into(),
@@ -1777,8 +1785,12 @@ impl Thread {
         });
 
         let model = match (resolved_saved_model, saved_selection) {
-            (Some(model), _) => ThreadModel::Ready(model),
-            (None, Some(selection)) => ThreadModel::Unresolved(selection),
+            (Some(model), _) => ThreadModel::Ready(
+                saved_account_id
+                    .and_then(|id| model.with_account(id))
+                    .unwrap_or(model),
+            ),
+            (None, Some(selection)) => ThreadModel::Unresolved(selection, saved_account_id),
             (None, None) => Self::resolve_profile_model(&profile_id, cx)
                 .or_else(|| {
                     LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
@@ -2013,13 +2025,16 @@ impl Thread {
     ) {
         let resolved = match &self.model {
             ThreadModel::Ready(_) => return,
-            ThreadModel::Unresolved(selection) => {
-                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-                    registry
-                        .select_model(selection, cx)
-                        .map(|configured| configured.model)
-                })
-            }
+            ThreadModel::Unresolved(selection, account_id) => LanguageModelRegistry::global(cx)
+                .update(cx, |registry, cx| {
+                    registry.select_model(selection, cx).map(|configured| {
+                        let model = configured.model;
+                        account_id
+                            .clone()
+                            .and_then(|id| model.with_account(id))
+                            .unwrap_or(model)
+                    })
+                }),
             ThreadModel::Unset => default_model.cloned(),
         };
 
@@ -2029,6 +2044,15 @@ impl Thread {
     }
 
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
+        let model = if model.account_id().is_none() {
+            self.model()
+                .filter(|previous| previous.provider_id() == model.provider_id())
+                .and_then(|previous| previous.account_id())
+                .and_then(|id| model.with_account(id.to_owned()))
+                .unwrap_or(model)
+        } else {
+            model
+        };
         let old_usage = self.latest_token_usage();
         self.model = ThreadModel::Ready(model.clone());
         let new_caps = Self::prompt_capabilities(self.model.as_model().map(|model| model.as_ref()));

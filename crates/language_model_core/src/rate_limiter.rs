@@ -56,10 +56,7 @@ impl RateLimiter {
     pub fn stream<'a, Fut, T>(
         &self,
         future: Fut,
-    ) -> impl 'a
-    + Future<
-        Output = Result<impl Stream<Item = T::Item> + use<Fut, T>, LanguageModelCompletionError>,
-    >
+    ) -> impl 'a + Future<Output = Result<RateLimitGuard<T>, LanguageModelCompletionError>>
     where
         Fut: 'a + Future<Output = Result<T, LanguageModelCompletionError>>,
         T: Stream,

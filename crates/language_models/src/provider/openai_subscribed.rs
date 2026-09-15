@@ -1,3 +1,4 @@
+use crate::AllLanguageModelSettings;
 use anyhow::{Result, anyhow};
 use credentials_provider::CredentialsProvider;
 use futures::future::Shared;
@@ -8,7 +9,10 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, ProviderSettingsView,
 };
-use openai_subscribed::{PROVIDER_ID, PROVIDER_NAME, State, create_language_model};
+use openai_subscribed::{
+    AccountSwitchPolicy, PROVIDER_ID, PROVIDER_NAME, State, create_language_model,
+};
+use settings::{Settings as _, SettingsStore};
 use std::sync::Arc;
 use ui::{ConfiguredApiCard, prelude::*};
 
@@ -25,7 +29,21 @@ impl OpenAiSubscribedProvider {
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut App,
     ) -> Self {
-        let state = cx.new(|cx| State::new(http_client, credentials_provider, cx));
+        let apply_policy = |state: &mut State, cx: &mut Context<State>| {
+            let policy = AllLanguageModelSettings::try_get(cx)
+                .and_then(|settings| settings.openai_account_switch_policy)
+                .map(|policy| match policy {
+                    settings::OpenAiAccountSwitchPolicy::Manual => AccountSwitchPolicy::Manual,
+                    settings::OpenAiAccountSwitchPolicy::OnError => AccountSwitchPolicy::OnError,
+                });
+            state.configure_switch_policy(policy, cx);
+        };
+        let state = cx.new(|cx| {
+            let mut state = State::new(http_client, credentials_provider, cx);
+            apply_policy(&mut state, cx);
+            cx.observe_global::<SettingsStore>(apply_policy).detach();
+            state
+        });
         Self { state }
     }
 }
@@ -128,7 +146,8 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
                 create_view: Arc::new({
                     let state = self.state.clone();
                     move |_window, cx| {
-                        cx.new(|_cx| ConfigurationView {
+                        cx.new(|cx| ConfigurationView {
+                            _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
                             state: state.clone(),
                             compact: true,
                         })
@@ -163,6 +182,7 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
 }
 
 struct ConfigurationView {
+    _subscription: gpui::Subscription,
     state: Entity<State>,
     /// When `true`, the description is rendered elsewhere (the settings row's
     /// left column), so it's omitted here to avoid duplication.
@@ -173,43 +193,13 @@ impl Render for ConfigurationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
 
-        if state.is_authenticated() {
-            let label = state
-                .email()
-                .map(|e| format!("Signed in as {e}"))
-                .unwrap_or_else(|| "Signed in".to_string());
-            let model_catalog_error = state.model_catalog_error();
-
-            let state_entity = self.state.clone();
-
-            return v_flex()
-                .gap_2()
-                .child(
-                    ConfiguredApiCard::new("openai-subscribed-sign-out", SharedString::from(label))
-                        .button_label("Sign Out")
-                        .on_click(cx.listener(move |_this, _, _window, cx| {
-                            state_entity
-                                .update(cx, |state, cx| state.sign_out(cx))
-                                .detach_and_log_err(cx);
-                        })),
-                )
-                .when_some(model_catalog_error, |this, error| {
-                    this.child(
-                        h_flex()
-                            .gap_1()
-                            .justify_center()
-                            .child(
-                                Icon::new(IconName::XCircle)
-                                    .color(Color::Error)
-                                    .size(IconSize::Small),
-                            )
-                            .child(Label::new(error).color(Color::Muted)),
-                    )
-                })
-                .into_any_element();
-        }
-
+        let accounts = state.accounts();
+        let policy = state.switch_policy();
+        let policy_state = self.state.clone();
+        let account_state = self.state.clone();
+        let has_accounts = !accounts.is_empty();
         let last_auth_error = state.last_auth_error();
+        let model_catalog_error = state.model_catalog_error();
         let provider_state = self.state.clone();
         let cancel_provider_state = self.state.clone();
 
@@ -218,11 +208,117 @@ impl Render for ConfigurationView {
         let button_label = if is_signing_in {
             "Signing in…"
         } else {
-            "Sign In"
+            if has_accounts {
+                "Add Account"
+            } else {
+                "Sign In"
+            }
         };
 
         v_flex()
             .gap_2()
+            .children(accounts.into_iter().map(|account| {
+                let reset_state = account_state.clone();
+                let reauth_state = account_state.clone();
+                let reset_id = account.id.clone();
+                let remove_state = account_state.clone();
+                let select_state = account_state.clone();
+                let remove_id = account.id.clone();
+                let select_id = account.id.clone();
+                v_flex()
+                    .gap_1()
+                    .child(
+                        ConfiguredApiCard::new(
+                            SharedString::from(format!("account-{}", account.id)),
+                            SharedString::from(account.label),
+                        )
+                        .button_label("Remove")
+                        .on_click(move |_, _, cx| {
+                            remove_state
+                                .update(cx, |state, cx| state.remove_account(&remove_id, cx));
+                        }),
+                    )
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("select-{}", account.id)),
+                            if account.selected {
+                                "Default account"
+                            } else {
+                                "Use by default"
+                            },
+                        )
+                        .disabled(account.selected)
+                        .on_click(move |_, _, cx| {
+                            select_state.update(cx, |state, cx| {
+                                state.select_account(select_id.clone(), cx)
+                            });
+                        }),
+                    )
+                    .when(!account.status.is_empty(), |this| {
+                        this.child(Label::new(account.status.clone()).color(Color::Warning))
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("reauth-{}", account.id)),
+                                    "Sign in again",
+                                )
+                                .disabled(is_signing_in)
+                                .on_click(move |_, _, cx| {
+                                    reauth_state.update(cx, |state, cx| state.sign_in(cx));
+                                }),
+                            )
+                            .when(account.status == "Plan quota reached", |this| {
+                                this.child(
+                                    Button::new(
+                                        SharedString::from(format!("reset-{}", account.id)),
+                                        "I've updated my quota",
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            reset_state.update(cx, |state, cx| {
+                                                state.reset_account_availability(&reset_id, cx)
+                                            });
+                                        },
+                                    ),
+                                )
+                            })
+                    })
+            }))
+            .when(has_accounts, |this| {
+                this.child(
+                    Button::new(
+                        "account-switch-policy",
+                        match policy {
+                            AccountSwitchPolicy::Manual => "Account switching: Manual",
+                            AccountSwitchPolicy::OnError => "Account switching: On error",
+                        },
+                    )
+                    .on_click(move |_, _, cx| {
+                        let policy = match policy {
+                            AccountSwitchPolicy::Manual => AccountSwitchPolicy::OnError,
+                            AccountSwitchPolicy::OnError => AccountSwitchPolicy::Manual,
+                        };
+                        policy_state.update(cx, |state, cx| {
+                            state.configure_switch_policy(Some(policy), cx)
+                        });
+                        let fs = <dyn fs::Fs>::global(cx);
+                        settings::update_settings_file(fs, cx, move |settings, _| {
+                            settings
+                                .language_models
+                                .get_or_insert_default()
+                                .openai_subscribed
+                                .get_or_insert_default()
+                                .account_switch_policy = Some(match policy {
+                                AccountSwitchPolicy::Manual => {
+                                    settings::OpenAiAccountSwitchPolicy::Manual
+                                }
+                                AccountSwitchPolicy::OnError => {
+                                    settings::OpenAiAccountSwitchPolicy::OnError
+                                }
+                            });
+                        });
+                    }),
+                )
+            })
             .when(!self.compact, |this| {
                 this.child(Label::new(SUBSCRIPTION_DESCRIPTION))
             })
@@ -252,6 +348,9 @@ impl Render for ConfigurationView {
                         )
                     }),
             )
+            .when_some(model_catalog_error, |this, error| {
+                this.child(Label::new(error).color(Color::Warning))
+            })
             .when_some(last_auth_error, |this, error| {
                 this.child(
                     h_flex()

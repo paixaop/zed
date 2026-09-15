@@ -582,6 +582,7 @@ pub struct ThreadView {
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
+    account_usage: Option<(String, Entity<crate::account_usage::AccountUsageView>)>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
@@ -950,10 +951,17 @@ impl ThreadView {
                         if matches!(this.thread_error, Some(ThreadError::NoModelSelected)) {
                             this.clear_thread_error(cx);
                         }
+                        cx.notify();
                     },
                 ));
             }
         }
+
+        subscriptions.push(cx.subscribe(&LanguageModelRegistry::global(cx), |_, _, event, cx| {
+            if matches!(event, language_model::Event::ProviderStateChanged(provider) if provider.0.as_ref() == "openai-subscribed") {
+                cx.notify();
+            }
+        }));
 
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
             let is_empty = editor.read(cx).text(cx).is_empty();
@@ -998,6 +1006,7 @@ impl ThreadView {
             mode_selector,
             model_selector,
             profile_selector,
+            account_usage: None,
             list_state,
             session_capabilities,
             resumed_without_history,
@@ -4465,6 +4474,8 @@ impl ThreadView {
                                     .gap_1()
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
+                                    .children(self.render_account_picker(cx))
+                                    .children(self.render_account_usage(cx))
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
                                         None => this
@@ -4476,6 +4487,86 @@ impl ThreadView {
                     ),
             )
             .into_any()
+    }
+
+    fn render_account_usage(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::account_usage::AccountUsageView>> {
+        let selected = self.as_native_thread(cx).and_then(|thread| {
+            let model = thread.read(cx).model()?.clone();
+            if model.provider_id().0.as_ref() != "openai-subscribed" {
+                return None;
+            }
+            let account = model
+                .accounts(cx)
+                .into_iter()
+                .find(|account| account.selected)?;
+            Some((account.id.clone(), model.with_account(account.id)?))
+        });
+        let Some((id, model)) = selected else {
+            self.account_usage = None;
+            return None;
+        };
+        if self
+            .account_usage
+            .as_ref()
+            .is_none_or(|(current, _)| current != &id)
+        {
+            self.account_usage = Some((
+                id,
+                cx.new(|cx| crate::account_usage::AccountUsageView::new(model, cx)),
+            ));
+        }
+        self.account_usage.as_ref().map(|(_, view)| view.clone())
+    }
+
+    fn render_account_picker(&self, cx: &App) -> Option<impl IntoElement> {
+        let thread = self.as_native_thread(cx)?;
+        let model = thread.read(cx).model()?.clone();
+        let accounts = model.accounts(cx);
+        if accounts.is_empty() {
+            return None;
+        }
+        let label = accounts
+            .iter()
+            .find(|account| account.selected)
+            .map(|account| account.label.clone())
+            .unwrap_or_else(|| "Account".into());
+        Some(
+            PopoverMenu::new("subscription-account-picker")
+                .trigger(
+                    Button::new("subscription-account", label)
+                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                )
+                .menu(move |window, cx| {
+                    Some(ContextMenu::build(window, cx, |mut menu, _, _| {
+                        menu = menu.header("ChatGPT account for this thread");
+                        for account in accounts.clone() {
+                            let label = if account.status.is_empty() {
+                                account.label
+                            } else {
+                                format!("{} — {}", account.label, account.status)
+                            };
+                            let model = model.clone();
+                            let thread = thread.clone();
+                            menu.push_item(
+                                ContextMenuEntry::new(label)
+                                    .toggleable(IconPosition::End, account.selected)
+                                    .handler(move |_, cx| {
+                                        if let Some(model) = model.with_account(account.id.clone())
+                                        {
+                                            thread.update(cx, |thread, cx| {
+                                                thread.set_model(model, cx)
+                                            });
+                                        }
+                                    }),
+                            );
+                        }
+                        menu
+                    }))
+                }),
+        )
     }
 
     fn render_queue_steer_button(
@@ -11272,7 +11363,7 @@ impl ThreadView {
         let (title, description): (SharedString, SharedString) =
             match thread.read(cx).thread_model() {
                 agent::ThreadModel::Ready(_) => return None,
-                agent::ThreadModel::Unresolved(selected_model) => {
+                agent::ThreadModel::Unresolved(selected_model, _) => {
                     if let Some(provider) = LanguageModelRegistry::global(cx)
                         .read(cx)
                         .provider(&&selected_model.provider)

@@ -44,6 +44,8 @@ pub struct SerializedThread {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct SerializedLanguageModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub provider: String,
     pub model: String,
 }
@@ -230,6 +232,19 @@ mod tests {
     use chrono::Utc;
     use language_model::{Role, TokenUsage};
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_serialized_model_preserves_optional_account() {
+        let legacy = r#"{"provider":"openai-subscribed","model":"gpt-5.4"}"#;
+        let mut model: SerializedLanguageModel =
+            serde_json::from_str(legacy).expect("legacy model");
+        assert!(model.account_id.is_none());
+        model.account_id = Some("subscription-account".into());
+        let restored: SerializedLanguageModel =
+            serde_json::from_str(&serde_json::to_string(&model).expect("serialize"))
+                .expect("restore");
+        assert_eq!(restored, model);
+    }
 
     #[test]
     fn test_legacy_serialized_thread_upgrade() {

@@ -23,11 +23,26 @@ pub struct AllLanguageModelSettingsContent {
     pub opencode: Option<OpenCodeSettingsContent>,
     pub open_router: Option<OpenRouterSettingsContent>,
     pub openai: Option<OpenAiSettingsContent>,
+    pub openai_subscribed: Option<OpenAiSubscribedSettingsContent>,
     pub openai_compatible: Option<HashMap<Arc<str>, OpenAiCompatibleSettingsContent>>,
     pub vercel_ai_gateway: Option<VercelAiGatewaySettingsContent>,
     pub x_ai: Option<XAiSettingsContent>,
     #[serde(rename = "zed.dev")]
     pub zed_dot_dev: Option<ZedDotDevSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct OpenAiSubscribedSettingsContent {
+    /// Whether ChatGPT requests may move to another eligible subscription after retries fail.
+    pub account_switch_policy: Option<OpenAiAccountSwitchPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiAccountSwitchPolicy {
+    Manual,
+    OnError,
 }
 
 #[with_fallible_options]

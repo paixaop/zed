@@ -2596,6 +2596,9 @@
     "llama.cpp": {
       "api_url": "http://localhost:8080",
     },
+    "openai_subscribed": {
+      "account_switch_policy": "on_error"
+    },
     "openai": {
       "api_url": "https://api.openai.com/v1",
     },

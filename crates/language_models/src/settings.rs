@@ -27,6 +27,7 @@ pub struct AllLanguageModelSettings {
     pub opencode: OpenCodeSettings,
     pub open_router: OpenRouterSettings,
     pub openai: OpenAiSettings,
+    pub openai_account_switch_policy: Option<settings::OpenAiAccountSwitchPolicy>,
     pub openai_compatible: HashMap<Arc<str>, OpenAiCompatibleSettings>,
     pub vercel_ai_gateway: VercelAiGatewaySettings,
     pub x_ai: XAiSettings,
@@ -168,6 +169,9 @@ impl settings::Settings for AllLanguageModelSettings {
                     open_router::RESERVED_HEADER_NAMES,
                 ),
             },
+            openai_account_switch_policy: language_models
+                .openai_subscribed
+                .and_then(|settings| settings.account_switch_policy),
             openai: OpenAiSettings {
                 api_url: openai.api_url.unwrap(),
                 available_models: openai.available_models.unwrap_or_default(),
