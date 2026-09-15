@@ -813,32 +813,18 @@ pub async fn stream_response_ref(
     request: &Request,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
-    let uri = format!("{api_url}/responses");
-    let is_streaming = request.stream;
-    let request = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
-        .extra_headers(extra_headers)
-        .body(AsyncBody::from(
-            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
-        ))
-        .map_err(|e| RequestError::Other(e.into()))?;
-
-    let host = request.uri().host().unwrap_or(api_url).to_owned();
-    let mut response = client
-        .send(request)
-        .await
-        .map_err(|error| RequestError::HttpSend {
-            provider: provider_name.to_owned(),
-            host,
-            error,
-        })?;
-    if response.status().is_success() {
-        if is_streaming {
-            let reader = BufReader::new(response.into_body());
-            Ok(reader
+    let response = send_response_request(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        extra_headers,
+    )
+    .await?;
+    if request.stream && response.status().is_success() {
+        let reader = BufReader::new(response.into_body());
+        Ok(reader
                 .lines()
                 .filter_map(|line| async move {
                     match line {
@@ -866,140 +852,191 @@ pub async fn stream_response_ref(
                     }
                 })
                 .boxed())
-        } else {
-            let mut body = String::new();
-            response
-                .body_mut()
-                .read_to_string(&mut body)
-                .await
-                .map_err(|e| RequestError::Other(e.into()))?;
-
-            match serde_json::from_str::<ResponseSummary>(&body) {
-                Ok(response_summary) => {
-                    let events = vec![
-                        StreamEvent::Created {
-                            response: response_summary.clone(),
-                        },
-                        StreamEvent::InProgress {
-                            response: response_summary.clone(),
-                        },
-                    ];
-
-                    let mut all_events = events;
-                    for (output_index, item) in response_summary.output.iter().enumerate() {
-                        all_events.push(StreamEvent::OutputItemAdded {
-                            output_index,
-                            sequence_number: None,
-                            item: item.clone(),
-                        });
-
-                        match item {
-                            ResponseOutputItem::Message(message) => {
-                                for content_item in &message.content {
-                                    if let Some(text) = content_item.get("text") {
-                                        if let Some(text_str) = text.as_str() {
-                                            if let Some(ref item_id) = message.id {
-                                                all_events.push(StreamEvent::OutputTextDelta {
-                                                    item_id: item_id.clone(),
-                                                    output_index,
-                                                    content_index: None,
-                                                    delta: text_str.to_string(),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            ResponseOutputItem::FunctionCall(function_call) => {
-                                if let Some(ref item_id) = function_call.id {
-                                    all_events.push(StreamEvent::FunctionCallArgumentsDone {
-                                        item_id: item_id.clone(),
-                                        output_index,
-                                        arguments: function_call.arguments.clone(),
-                                        sequence_number: None,
-                                    });
-                                }
-                            }
-                            ResponseOutputItem::CustomToolCall(custom_tool_call) => {
-                                if let Some(ref item_id) = custom_tool_call.id {
-                                    all_events.push(StreamEvent::CustomToolCallInputDone {
-                                        item_id: item_id.clone(),
-                                        output_index,
-                                        input: custom_tool_call.input.clone(),
-                                        sequence_number: None,
-                                    });
-                                }
-                            }
-                            ResponseOutputItem::Reasoning(reasoning) => {
-                                if let Some(ref item_id) = reasoning.id {
-                                    for (summary_index, part) in
-                                        reasoning.summary.iter().enumerate()
-                                    {
-                                        if let ReasoningSummaryPart::SummaryText { text } = part {
-                                            all_events.push(
-                                                StreamEvent::ReasoningSummaryTextDelta {
-                                                    item_id: item_id.clone(),
-                                                    output_index,
-                                                    summary_index,
-                                                    delta: text.clone(),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            // No synthesized deltas; the `OutputItemDone`
-                            // event pushed below carries the full item.
-                            ResponseOutputItem::Compaction(_) => {}
-                            ResponseOutputItem::Unknown => {}
-                        }
-
-                        all_events.push(StreamEvent::OutputItemDone {
-                            output_index,
-                            sequence_number: None,
-                            item: item.clone(),
-                        });
-                    }
-
-                    let status = response_summary.status.clone();
-                    all_events.push(match status.as_deref() {
-                        Some("incomplete") => StreamEvent::Incomplete {
-                            response: response_summary,
-                        },
-                        Some("failed") => StreamEvent::Failed {
-                            response: response_summary,
-                        },
-                        _ => StreamEvent::Completed {
-                            response: response_summary,
-                        },
-                    });
-
-                    Ok(futures::stream::iter(all_events.into_iter().map(Ok)).boxed())
-                }
-                Err(error) => {
-                    log::error!(
-                        "Failed to parse OpenAI non-streaming response: `{}`\nResponse: `{}`",
-                        error,
-                        body,
-                    );
-                    Err(RequestError::Other(anyhow!(error)))
-                }
-            }
-        }
     } else {
-        let mut body = String::new();
-        response
-            .body_mut()
-            .read_to_string(&mut body)
-            .await
-            .map_err(|e| RequestError::Other(e.into()))?;
+        let body = read_response_body(response, provider_name).await?;
+        parse_response_events(&body)
+    }
+}
 
+async fn send_response_request(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: &Request,
+    extra_headers: &CustomHeaders,
+) -> Result<http_client::Response<AsyncBody>, RequestError> {
+    let uri = format!("{api_url}/responses");
+    let request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .extra_headers(extra_headers)
+        .body(AsyncBody::from(
+            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
+        ))
+        .map_err(|e| RequestError::Other(e.into()))?;
+
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
+    client
+        .send(request)
+        .await
+        .map_err(|error| RequestError::HttpSend {
+            provider: provider_name.to_owned(),
+            host,
+            error,
+        })
+}
+
+async fn read_response_body(
+    mut response: http_client::Response<AsyncBody>,
+    provider_name: &str,
+) -> Result<String, RequestError> {
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .map_err(|error| RequestError::Other(error.into()))?;
+    if response.status().is_success() {
+        Ok(body)
+    } else {
         Err(RequestError::HttpResponseError {
             provider: provider_name.to_owned(),
             status_code: response.status(),
             body,
             headers: Box::new(response.headers().clone()),
         })
+    }
+}
+
+fn parse_response_events(
+    body: &str,
+) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    let response_summary = serde_json::from_str::<ResponseSummary>(body).map_err(|error| {
+        log::error!("Failed to parse OpenAI non-streaming response: `{error}`\nResponse: `{body}`");
+        RequestError::Other(anyhow!(error))
+    })?;
+    Ok(futures::stream::iter(response_events(response_summary).into_iter().map(Ok)).boxed())
+}
+
+fn response_events(response_summary: ResponseSummary) -> Vec<StreamEvent> {
+    let events = vec![
+        StreamEvent::Created {
+            response: response_summary.clone(),
+        },
+        StreamEvent::InProgress {
+            response: response_summary.clone(),
+        },
+    ];
+
+    let mut all_events = events;
+    for (output_index, item) in response_summary.output.iter().enumerate() {
+        all_events.push(StreamEvent::OutputItemAdded {
+            output_index,
+            sequence_number: None,
+            item: item.clone(),
+        });
+
+        append_output_deltas(&mut all_events, output_index, item);
+
+        all_events.push(StreamEvent::OutputItemDone {
+            output_index,
+            sequence_number: None,
+            item: item.clone(),
+        });
+    }
+
+    all_events.push(response_completion_event(response_summary));
+
+    all_events
+}
+
+fn response_completion_event(response: ResponseSummary) -> StreamEvent {
+    match response.status.as_deref() {
+        Some("incomplete") => StreamEvent::Incomplete { response },
+        Some("failed") => StreamEvent::Failed { response },
+        _ => StreamEvent::Completed { response },
+    }
+}
+
+fn append_output_deltas(
+    all_events: &mut Vec<StreamEvent>,
+    output_index: usize,
+    item: &ResponseOutputItem,
+) {
+    if let ResponseOutputItem::Message(message) = item {
+        append_message_deltas(all_events, output_index, message);
+    }
+    if let Some(event) = tool_call_completion_event(item, output_index) {
+        all_events.push(event);
+    }
+    if let ResponseOutputItem::Reasoning(reasoning) = item {
+        append_reasoning_deltas(all_events, output_index, reasoning);
+    }
+}
+
+fn tool_call_completion_event(
+    item: &ResponseOutputItem,
+    output_index: usize,
+) -> Option<StreamEvent> {
+    if let ResponseOutputItem::FunctionCall(function_call) = item {
+        return Some(StreamEvent::FunctionCallArgumentsDone {
+            item_id: function_call.id.clone()?,
+            output_index,
+            arguments: function_call.arguments.clone(),
+            sequence_number: None,
+        });
+    }
+    if let ResponseOutputItem::CustomToolCall(custom_tool_call) = item {
+        return Some(StreamEvent::CustomToolCallInputDone {
+            item_id: custom_tool_call.id.clone()?,
+            output_index,
+            input: custom_tool_call.input.clone(),
+            sequence_number: None,
+        });
+    }
+    None
+}
+
+fn append_message_deltas(
+    all_events: &mut Vec<StreamEvent>,
+    output_index: usize,
+    message: &ResponseOutputMessage,
+) {
+    for content_item in &message.content {
+        if let Some(text) = content_item.get("text") {
+            if let Some(text_str) = text.as_str() {
+                if let Some(ref item_id) = message.id {
+                    all_events.push(StreamEvent::OutputTextDelta {
+                        item_id: item_id.clone(),
+                        output_index,
+                        content_index: None,
+                        delta: text_str.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn append_reasoning_deltas(
+    all_events: &mut Vec<StreamEvent>,
+    output_index: usize,
+    reasoning: &ResponseReasoningItem,
+) {
+    if let Some(ref item_id) = reasoning.id {
+        for (summary_index, part) in reasoning.summary.iter().enumerate() {
+            if let ReasoningSummaryPart::SummaryText { text } = part {
+                all_events.push(StreamEvent::ReasoningSummaryTextDelta {
+                    item_id: item_id.clone(),
+                    output_index,
+                    summary_index,
+                    delta: text.clone(),
+                });
+            }
+        }
     }
 }
 
@@ -1016,6 +1053,65 @@ mod tests {
     use language_model_core::OPEN_AI_PROVIDER_ID;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn non_streaming_responses_preserve_output_and_terminal_status() {
+        let output = json!([
+            {"type":"message", "id":"message", "content":[{"text":"hello"}, {"text":7}, {}]},
+            {"type":"function_call", "id":"function", "arguments":"{}"},
+            {"type":"custom_tool_call", "id":"custom", "input":"command"},
+            {"type":"reasoning", "id":"reasoning", "summary":[{"type":"summary_text", "text":"summary"}, {"type":"future_part"}]},
+            {"type":"message", "content":[{"text":"no id"}]},
+            {"type":"function_call"},
+            {"type":"custom_tool_call"},
+            {"type":"reasoning", "summary":[{"type":"summary_text", "text":"no id"}]},
+            {"type":"future_item"}
+        ]);
+        for status in ["completed", "incomplete", "failed"] {
+            let body = json!({"status":status, "output":output}).to_string();
+            let events = block_on(
+                parse_response_events(&body)
+                    .expect("valid response")
+                    .collect::<Vec<_>>(),
+            );
+            let events = events
+                .into_iter()
+                .collect::<anyhow::Result<Vec<_>>>()
+                .expect("events");
+            assert!(matches!(events.first(), Some(StreamEvent::Created { .. })));
+            assert!(matches!(
+                events.get(1),
+                Some(StreamEvent::InProgress { .. })
+            ));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::OutputItemAdded { .. }))
+                    .count(),
+                9
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::OutputItemDone { .. }))
+                    .count(),
+                9
+            );
+            assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::OutputTextDelta { delta, .. } if delta == "hello")).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::FunctionCallArgumentsDone { arguments, .. } if arguments == "{}")).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::CustomToolCallInputDone { input, .. } if input == "command")).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ReasoningSummaryTextDelta { delta, .. } if delta == "summary")).count(), 1);
+            match status {
+                "incomplete" => assert!(matches!(
+                    events.last(),
+                    Some(StreamEvent::Incomplete { .. })
+                )),
+                "failed" => assert!(matches!(events.last(), Some(StreamEvent::Failed { .. }))),
+                _ => assert!(matches!(events.last(), Some(StreamEvent::Completed { .. }))),
+            }
+        }
+        assert!(parse_response_events("invalid json").is_err());
+    }
 
     #[test]
     fn compact_response_posts_supported_request_fields() {

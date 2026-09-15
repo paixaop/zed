@@ -112,18 +112,17 @@ fn reset_time(
 }
 
 fn window_label(seconds: Option<u64>) -> String {
-    match seconds {
-        Some(604800) => "Weekly".into(),
-        Some(seconds) if seconds > 0 && seconds.is_multiple_of(86400) => {
-            format!("{}d", seconds / 86400)
-        }
-        Some(seconds) if seconds > 0 && seconds.is_multiple_of(3600) => {
-            format!("{}h", seconds / 3600)
-        }
-        Some(seconds) if seconds > 0 && seconds.is_multiple_of(60) => format!("{}m", seconds / 60),
-        Some(seconds) if seconds > 0 => format!("{seconds}s"),
-        _ => "Window".into(),
+    let Some(seconds) = seconds.filter(|seconds| *seconds > 0) else {
+        return "Window".into();
+    };
+    if seconds == 604800 {
+        return "Weekly".into();
     }
+    let (divisor, unit) = [(86400, "d"), (3600, "h"), (60, "m"), (1, "s")]
+        .into_iter()
+        .find(|(divisor, _)| seconds.is_multiple_of(*divisor))
+        .unwrap_or((1, "s"));
+    format!("{}{unit}", seconds / divisor)
 }
 
 impl RateLimit {
@@ -179,80 +178,103 @@ impl UsageResponse {
             );
         }
         if let Some(credits) = self.credits {
-            usage.details.push(
-                match (credits.unlimited, credits.has_credits) {
-                    (Some(true), _) => "Purchased-credit availability: unlimited",
-                    (_, Some(true)) => "Purchased-credit availability: available",
-                    (_, Some(false)) => "Purchased-credit availability: unavailable",
-                    (_, None) => "Purchased-credit availability: unknown",
-                }
-                .into(),
-            );
-            if credits.unlimited == Some(true) {
-                usage.details.push("Purchased credits: unlimited".into());
-            } else if let Some(balance) = credits.balance {
-                usage.details.push(format!("Purchased credits: {balance}"));
-            } else {
-                usage.details.push(
-                    match credits.has_credits {
-                        Some(true) => "Purchased credits available; balance unknown",
-                        Some(false) => "No purchased credits available",
-                        None => "Purchased credits: unknown",
-                    }
-                    .into(),
-                );
-            }
-            if credits.overage_limit_reached == Some(true) {
-                usage.warnings.push("Purchased-credit cap reached".into());
-            }
+            credits.append_to(&mut usage);
         }
         if let Some(control) = self.spend_control {
-            if control.reached == Some(true) {
-                usage.warnings.push("Monthly spend cap reached".into());
-            }
-            if let Some(limit) = control.individual_limit {
-                if let Some(remaining) = limit.remaining {
-                    usage
-                        .details
-                        .push(format!("Monthly credits remaining: {remaining}"));
-                }
-                if let Some(limit) = limit.limit {
-                    usage
-                        .details
-                        .push(format!("Monthly credit allowance: {limit}"));
-                }
-                usage.buckets.push(LanguageModelUsageBucket {
-                    name: "Monthly credit limit".into(),
-                    allowed: control.reached.map(|reached| !reached),
-                    limit_reached: control.reached,
-                    windows: vec![LanguageModelUsageWindow {
-                        label: "Monthly".into(),
-                        remaining_percent: limit
-                            .remaining_percent
-                            .or_else(|| limit.used_percent.map(|used| 100.0 - used))
-                            .filter(|remaining| remaining.is_finite())
-                            .map(|remaining| remaining.clamp(0.0, 100.0)),
-                        resets_at: reset_time(
-                            limit.reset_at,
-                            limit.reset_after_seconds,
-                            fetched_at,
-                        ),
-                    }],
-                });
-            }
+            control.append_to(&mut usage, fetched_at);
         }
-        if let Some(reason) = self.rate_limit_reached_type {
-            usage.details.push(format!("Limiter: {reason}"));
-        }
-        if let Some(count) = self
-            .rate_limit_reset_credits
-            .and_then(|credits| credits.available_count)
-        {
-            usage
-                .details
-                .push(format!("Available usage resets: {count}"));
-        }
+        append_limiter_details(
+            &mut usage,
+            self.rate_limit_reached_type,
+            self.rate_limit_reset_credits,
+        );
         usage
+    }
+}
+
+impl Credits {
+    fn balance_label(&self) -> String {
+        if self.unlimited == Some(true) {
+            "Purchased credits: unlimited".into()
+        } else if let Some(balance) = &self.balance {
+            format!("Purchased credits: {balance}")
+        } else {
+            self.unknown_balance_label().into()
+        }
+    }
+
+    fn unknown_balance_label(&self) -> &'static str {
+        match self.has_credits {
+            Some(true) => "Purchased credits available; balance unknown",
+            Some(false) => "No purchased credits available",
+            None => "Purchased credits: unknown",
+        }
+    }
+
+    fn availability_label(&self) -> &'static str {
+        match (self.unlimited, self.has_credits) {
+            (Some(true), _) => "Purchased-credit availability: unlimited",
+            (_, Some(true)) => "Purchased-credit availability: available",
+            (_, Some(false)) => "Purchased-credit availability: unavailable",
+            (_, None) => "Purchased-credit availability: unknown",
+        }
+    }
+
+    fn append_to(self, usage: &mut LanguageModelAccountUsage) {
+        usage.details.push(self.availability_label().into());
+        usage.details.push(self.balance_label());
+        if self.overage_limit_reached == Some(true) {
+            usage.warnings.push("Purchased-credit cap reached".into());
+        }
+    }
+}
+
+impl SpendControl {
+    fn append_to(self, usage: &mut LanguageModelAccountUsage, fetched_at: SystemTime) {
+        if self.reached == Some(true) {
+            usage.warnings.push("Monthly spend cap reached".into());
+        }
+        if let Some(limit) = self.individual_limit {
+            if let Some(remaining) = limit.remaining {
+                usage
+                    .details
+                    .push(format!("Monthly credits remaining: {remaining}"));
+            }
+            if let Some(limit) = limit.limit {
+                usage
+                    .details
+                    .push(format!("Monthly credit allowance: {limit}"));
+            }
+            usage.buckets.push(LanguageModelUsageBucket {
+                name: "Monthly credit limit".into(),
+                allowed: self.reached.map(|reached| !reached),
+                limit_reached: self.reached,
+                windows: vec![LanguageModelUsageWindow {
+                    label: "Monthly".into(),
+                    remaining_percent: limit
+                        .remaining_percent
+                        .or_else(|| limit.used_percent.map(|used| 100.0 - used))
+                        .filter(|remaining| remaining.is_finite())
+                        .map(|remaining| remaining.clamp(0.0, 100.0)),
+                    resets_at: reset_time(limit.reset_at, limit.reset_after_seconds, fetched_at),
+                }],
+            });
+        }
+    }
+}
+
+fn append_limiter_details(
+    usage: &mut LanguageModelAccountUsage,
+    reason: Option<String>,
+    reset_credits: Option<ResetCredits>,
+) {
+    if let Some(reason) = reason {
+        usage.details.push(format!("Limiter: {reason}"));
+    }
+    if let Some(count) = reset_credits.and_then(|credits| credits.available_count) {
+        usage
+            .details
+            .push(format!("Available usage resets: {count}"));
     }
 }
 
@@ -294,71 +316,93 @@ pub(super) fn load(
     cx.spawn(async move |_, _| task.await.map_err(|error| anyhow!("{error:#}")))
 }
 
+async fn request_usage(
+    http_client: &Arc<dyn HttpClient>,
+    credentials: &CodexCredentials,
+    cx: &AsyncApp,
+) -> Result<(http_client::StatusCode, String)> {
+    let request = async {
+        let headers = codex_extra_headers(credentials, None);
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(USAGE_URL)
+            .header("Accept", "application/json")
+            .header(
+                "Authorization",
+                format!("Bearer {}", credentials.access_token),
+            )
+            .extra_headers(&headers)
+            .body(AsyncBody::default())?;
+        let mut response = http_client.send(request).await?;
+        let status = response.status();
+        let mut body = String::new();
+        smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
+        anyhow::Ok((status, body))
+    };
+    let timeout = cx.background_executor().timer(REQUEST_TIMEOUT);
+    futures::select! {
+        result = request.fuse() => result,
+        () = timeout.fuse() => Err(anyhow!("ChatGPT usage request timed out")),
+    }
+}
+
+fn usage_failure(result: &Result<(http_client::StatusCode, String)>) -> AccountFailure {
+    result
+        .as_ref()
+        .map_or(AccountFailure::Transient, |(status, _)| {
+            if status.is_server_error() {
+                AccountFailure::Transient
+            } else if *status == http_client::StatusCode::UNAUTHORIZED {
+                AccountFailure::Unauthorized
+            } else {
+                AccountFailure::Other
+            }
+        })
+}
+
+fn decode_usage(
+    status: http_client::StatusCode,
+    body: &str,
+    credentials: &CodexCredentials,
+) -> Result<LanguageModelAccountUsage> {
+    anyhow::ensure!(
+        status.is_success(),
+        "Could not load ChatGPT account usage (HTTP {status})"
+    );
+    let response: UsageResponse =
+        serde_json::from_str(body).context("Invalid ChatGPT usage response")?;
+    if let Some(returned) = &response.account_id
+        && let Some(expected) = &credentials.account_id
+    {
+        anyhow::ensure!(
+            returned == expected,
+            "Usage response belongs to a different account"
+        );
+    }
+    Ok(response.normalize(SystemTime::now()))
+}
+
 async fn fetch(
     state: &WeakEntity<State>,
     http_client: &Arc<dyn HttpClient>,
     id: &str,
     cx: &mut AsyncApp,
 ) -> Result<LanguageModelAccountUsage> {
-    let mut credentials = account_credentials(state, http_client, id, None, cx).await?;
-    let mut refreshed = false;
-    let mut retried = false;
+    let credentials = account_credentials(state, http_client, id, None, cx).await?;
+    let mut retry = AccountRetry {
+        credentials,
+        refreshed: false,
+        retried: false,
+    };
     loop {
-        let result = async {
-            let headers = codex_extra_headers(&credentials, None);
-            let request = HttpRequest::builder()
-                .method(Method::GET)
-                .uri(USAGE_URL)
-                .header("Accept", "application/json")
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", credentials.access_token),
-                )
-                .extra_headers(&headers)
-                .body(AsyncBody::default())?;
-            let mut response = http_client.send(request).await?;
-            let status = response.status();
-            let mut body = String::new();
-            smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
-            anyhow::Ok((status, body))
-        };
-        let timeout = cx.background_executor().timer(REQUEST_TIMEOUT);
-        let result = futures::select! {
-            result = result.fuse() => result,
-            () = timeout.fuse() => Err(anyhow!("ChatGPT usage request timed out")),
-        };
-        if !retried
-            && result
-                .as_ref()
-                .map_or(true, |(status, _)| status.is_server_error())
+        let result = request_usage(http_client, &retry.credentials, cx).await;
+        if retry
+            .recover(&usage_failure(&result), state, http_client, id, cx)
+            .await?
         {
-            retried = true;
-            cx.background_executor().timer(Duration::from_secs(1)).await;
             continue;
         }
-        let (status, body) = result?;
-        if status == http_client::StatusCode::UNAUTHORIZED && !refreshed {
-            refreshed = true;
-            credentials =
-                account_credentials(state, http_client, id, Some(&credentials.access_token), cx)
-                    .await?;
-            continue;
-        }
-        anyhow::ensure!(
-            status.is_success(),
-            "Could not load ChatGPT account usage (HTTP {status})"
-        );
-        let response: UsageResponse =
-            serde_json::from_str(&body).context("Invalid ChatGPT usage response")?;
-        if let Some(returned) = &response.account_id
-            && let Some(expected) = &credentials.account_id
-        {
-            anyhow::ensure!(
-                returned == expected,
-                "Usage response belongs to a different account"
-            );
-        }
-        return Ok(response.normalize(SystemTime::now()));
+        return result.and_then(|(status, body)| decode_usage(status, &body, &retry.credentials));
     }
 }
 
