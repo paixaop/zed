@@ -2870,6 +2870,8 @@ mod tests {
             response: ResponseSummary {
                 status: Some("failed".into()),
                 error: Some(ResponseError {
+                    resets_at: None,
+                    required_scope: None,
                     code: Some("server_error".into()),
                     error_type: None,
                     message: "The model failed to generate a response.".into(),
@@ -3079,6 +3081,8 @@ mod tests {
             response: ResponseSummary {
                 status: Some("failed".into()),
                 error: Some(ResponseError {
+                    resets_at: None,
+                    required_scope: None,
                     code: Some("context_length_exceeded".into()),
                     error_type: None,
                     message: "Your input exceeds the context window of this model.".into(),

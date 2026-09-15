@@ -88,7 +88,57 @@ impl Default for LanguageModelTextStream {
     }
 }
 
+#[derive(Clone)]
+pub struct LanguageModelAccount {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LanguageModelAccountUsage {
+    pub plan: Option<String>,
+    pub buckets: Vec<LanguageModelUsageBucket>,
+    pub details: Vec<String>,
+    pub warnings: Vec<String>,
+    pub fetched_at: std::time::SystemTime,
+}
+
+#[derive(Clone, Debug)]
+pub struct LanguageModelUsageBucket {
+    pub name: String,
+    pub allowed: Option<bool>,
+    pub limit_reached: Option<bool>,
+    pub windows: Vec<LanguageModelUsageWindow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LanguageModelUsageWindow {
+    pub label: String,
+    pub remaining_percent: Option<f64>,
+    pub resets_at: Option<std::time::SystemTime>,
+}
+
 pub trait LanguageModel: Send + Sync {
+    fn account_usage(
+        &self,
+        _force: bool,
+        _cx: &mut App,
+    ) -> Option<Task<Result<LanguageModelAccountUsage>>> {
+        None
+    }
+
+    fn account_id(&self) -> Option<&str> {
+        None
+    }
+    fn accounts(&self, _cx: &App) -> Vec<LanguageModelAccount> {
+        Vec::new()
+    }
+    fn with_account(&self, _id: String) -> Option<Arc<dyn LanguageModel>> {
+        None
+    }
+
     fn id(&self) -> LanguageModelId;
     fn name(&self) -> LanguageModelName;
     fn provider_id(&self) -> LanguageModelProviderId;
