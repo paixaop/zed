@@ -773,6 +773,79 @@ pub fn open_markdown_in_workspace(
     })
 }
 
+fn model_unavailable_message(
+    model: &agent::ThreadModel,
+    has_authenticated_provider: bool,
+    cx: &App,
+) -> Option<(SharedString, SharedString)> {
+    match model {
+        agent::ThreadModel::Ready(_) => None,
+        agent::ThreadModel::Unresolved(selected, _) => Some(unresolved_model_message(selected, cx)),
+        agent::ThreadModel::Unset => Some(unset_model_message(has_authenticated_provider)),
+    }
+}
+
+fn unresolved_model_message(
+    selected: &language_model::SelectedModel,
+    cx: &App,
+) -> (SharedString, SharedString) {
+    if let Some(provider) = LanguageModelRegistry::read_global(cx).provider(&selected.provider) {
+        return provider_model_message(selected, provider.as_ref(), cx);
+    }
+    (
+        format!("Provider {} was not found", selected.provider).into(),
+        "Open the settings to configure providers".into(),
+    )
+}
+
+fn provider_model_message(
+    selected: &language_model::SelectedModel,
+    provider: &dyn LanguageModelProvider,
+    cx: &App,
+) -> (SharedString, SharedString) {
+    if !provider.is_authenticated(cx) {
+        return (
+            format!("Failed to authenticate with {} provider", provider.name()).into(),
+            "Open the settings to configure the selected provider".into(),
+        );
+    }
+    (
+        format!("Model {} was not found", selected.model.0).into(),
+        "You may need to reconfigure authentication for this provider".into(),
+    )
+}
+
+fn unset_model_message(has_authenticated_provider: bool) -> (SharedString, SharedString) {
+    let description = if has_authenticated_provider {
+        "Choose a different model or configure other providers to get started"
+    } else {
+        "Configure a provider to get started"
+    };
+    ("No model selected".into(), description.into())
+}
+
+fn thread_initial_title(
+    thread: &Entity<AcpThread>,
+    is_root: bool,
+    saved_title: Option<SharedString>,
+    cx: &App,
+) -> SharedString {
+    let title = if is_root {
+        saved_title
+    } else {
+        thread.read(cx).title()
+    };
+    title.unwrap_or_else(|| DEFAULT_THREAD_TITLE.into())
+}
+
+fn show_codex_windows_warning(project: &WeakEntity<Project>, agent_id: &AgentId, cx: &App) -> bool {
+    cfg!(windows)
+        && project
+            .upgrade()
+            .is_some_and(|project| project.read(cx).is_local())
+        && agent_id.as_ref() == "Codex"
+}
+
 impl ThreadView {
     pub(crate) fn new(
         root_thread_id: ThreadId,
@@ -855,9 +928,7 @@ impl ThreadView {
             editor
         });
 
-        let show_codex_windows_warning = cfg!(windows)
-            && project.upgrade().is_some_and(|p| p.read(cx).is_local())
-            && agent_id.as_ref() == "Codex";
+        let show_codex_windows_warning = show_codex_windows_warning(&project, &agent_id, cx);
 
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
@@ -879,12 +950,12 @@ impl ThreadView {
         let title_editor = {
             let metadata = ThreadMetadataStore::try_global(cx)
                 .and_then(|store| store.read(cx).entry(root_thread_id).cloned());
-            let initial_title = if parent_session_id.is_none() {
-                metadata.as_ref().and_then(|m| m.title())
-            } else {
-                thread.read(cx).title()
-            }
-            .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
+            let initial_title = thread_initial_title(
+                &thread,
+                parent_session_id.is_none(),
+                metadata.as_ref().and_then(|metadata| metadata.title()),
+                cx,
+            );
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_text(initial_title, window, cx);
@@ -941,6 +1012,12 @@ impl ThreadView {
                 },
             ));
 
+            subscriptions.push(cx.subscribe(&LanguageModelRegistry::global(cx), |_, _, event, cx| {
+                if matches!(event, language_model::Event::ProviderStateChanged(provider) if provider.0.as_ref() == "openai-subscribed") {
+                    cx.notify();
+                }
+            }));
+
             // A "no model selected" error is stale as soon as the thread has a
             // usable model
             if let Some(native_thread) = native_connection.thread(thread.read(cx).session_id(), cx)
@@ -956,12 +1033,6 @@ impl ThreadView {
                 ));
             }
         }
-
-        subscriptions.push(cx.subscribe(&LanguageModelRegistry::global(cx), |_, _, event, cx| {
-            if matches!(event, language_model::Event::ProviderStateChanged(provider) if provider.0.as_ref() == "openai-subscribed") {
-                cx.notify();
-            }
-        }));
 
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
             let is_empty = editor.read(cx).text(cx).is_empty();
@@ -4523,7 +4594,15 @@ impl ThreadView {
 
     fn render_account_picker(&self, cx: &App) -> Option<impl IntoElement> {
         let thread = self.as_native_thread(cx)?;
-        let model = thread.read(cx).model()?.clone();
+        let model = thread.read(cx).model().cloned();
+        model.and_then(|model| Self::render_model_account_picker(thread, model, cx))
+    }
+
+    fn render_model_account_picker(
+        thread: Entity<agent::Thread>,
+        model: Arc<dyn LanguageModel>,
+        cx: &App,
+    ) -> Option<impl IntoElement> {
         let accounts = model.accounts(cx);
         if accounts.is_empty() {
             return None;
@@ -11360,66 +11439,29 @@ impl ThreadView {
         let has_authenticated_provider =
             LanguageModelRegistry::read_global(cx).has_authenticated_provider(cx);
 
-        let (title, description): (SharedString, SharedString) =
-            match thread.read(cx).thread_model() {
-                agent::ThreadModel::Ready(_) => return None,
-                agent::ThreadModel::Unresolved(selected_model, _) => {
-                    if let Some(provider) = LanguageModelRegistry::global(cx)
-                        .read(cx)
-                        .provider(&&selected_model.provider)
-                    {
-                        if !provider.is_authenticated(cx) {
-                            (
-                                format!("Failed to authenticate with {} provider", provider.name())
-                                    .into(),
-                                "Open the settings to configure the selected provider".into(),
-                            )
-                        } else {
-                            (
-                                format!("Model {} was not found", selected_model.model.0).into(),
-                                "You may need to reconfigure authentication for this provider"
-                                    .into(),
-                            )
-                        }
-                    } else {
-                        (
-                            format!("Provider {} was not found", selected_model.provider).into(),
-                            "Open the settings to configure providers".into(),
-                        )
-                    }
-                }
-                agent::ThreadModel::Unset => {
-                    if has_authenticated_provider {
-                        (
-                            "No model selected".into(),
-                            "Choose a different model or configure other providers to get started"
-                                .into(),
-                        )
-                    } else {
-                        (
-                            "No model selected".into(),
-                            "Configure a provider to get started".into(),
-                        )
-                    }
-                }
-            };
+        model_unavailable_message(
+            thread.read(cx).thread_model(),
+            has_authenticated_provider,
+            cx,
+        )
+        .map(|(title, description)| {
+            let callout = Callout::new()
+                .severity(Severity::Error)
+                .icon(IconName::XCircle)
+                .title(title)
+                .description(description)
+                .actions_slot(
+                    h_flex()
+                        .gap_1()
+                        .child(self.open_llm_providers_settings_button(cx))
+                        .when(has_authenticated_provider, |this| {
+                            this.child(self.open_model_selector_button(cx))
+                        }),
+                )
+                .dismiss_action(self.dismiss_error_button(cx));
 
-        let callout = Callout::new()
-            .severity(Severity::Error)
-            .icon(IconName::XCircle)
-            .title(title)
-            .description(description)
-            .actions_slot(
-                h_flex()
-                    .gap_1()
-                    .child(self.open_llm_providers_settings_button(cx))
-                    .when(has_authenticated_provider, |this| {
-                        this.child(self.open_model_selector_button(cx))
-                    }),
-            )
-            .dismiss_action(self.dismiss_error_button(cx));
-
-        Some(callout)
+            callout
+        })
     }
 
     fn open_llm_providers_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -12826,6 +12868,34 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    #[gpui::test]
+    fn model_errors_distinguish_unset_missing_and_ready_models(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let provider = LanguageModelRegistry::test(cx);
+            assert!(
+                model_unavailable_message(
+                    &agent::ThreadModel::Ready(Arc::new(provider.test_model())),
+                    true,
+                    cx
+                )
+                .is_none()
+            );
+            let unset = model_unavailable_message(&agent::ThreadModel::Unset, false, cx)
+                .expect("unset error");
+            assert_eq!(unset.0.as_ref(), "No model selected");
+            assert_eq!(unset.1.as_ref(), "Configure a provider to get started");
+            let model = agent::ThreadModel::Unresolved(
+                language_model::SelectedModel {
+                    provider: LanguageModelProviderId("missing".into()),
+                    model: LanguageModelId("missing".into()),
+                },
+                Some("saved-account".into()),
+            );
+            let missing = model_unavailable_message(&model, true, cx).expect("missing error");
+            assert_eq!(missing.0.as_ref(), "Provider missing was not found");
+        });
     }
 
     #[test]

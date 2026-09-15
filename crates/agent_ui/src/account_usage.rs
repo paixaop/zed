@@ -74,19 +74,27 @@ impl AccountUsageView {
     }
 }
 
+fn quota_exhausted_label(name: &str) -> &'static str {
+    if name == "Included usage" {
+        "Included quota exhausted"
+    } else {
+        "Quota exhausted"
+    }
+}
+
+fn usage_unavailable_label(name: &str) -> &'static str {
+    if name == "Included usage" {
+        "Included usage unavailable"
+    } else {
+        "Usage currently unavailable"
+    }
+}
+
 fn bucket_status(bucket: &LanguageModelUsageBucket) -> Option<&'static str> {
     if bucket.limit_reached == Some(true) {
-        Some(if bucket.name == "Included usage" {
-            "Included quota exhausted"
-        } else {
-            "Quota exhausted"
-        })
+        Some(quota_exhausted_label(&bucket.name))
     } else if bucket.allowed == Some(false) {
-        Some(if bucket.name == "Included usage" {
-            "Included usage unavailable"
-        } else {
-            "Usage currently unavailable"
-        })
+        Some(usage_unavailable_label(&bucket.name))
     } else if bucket.allowed.is_none() {
         Some("Availability unknown")
     } else {
@@ -103,27 +111,25 @@ fn remaining_label(window: &LanguageModelUsageWindow) -> String {
 
 fn usage_error_label(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
-    if error.contains("connect") || error.contains("dns") {
-        "connection error"
-    } else if error.contains("timed out") || error.contains("timeout") {
-        "request timed out"
-    } else if error.contains("401")
-        || error.contains("authentication")
-        || error.contains("reauth")
-        || error.contains("invalid_grant")
-    {
-        "sign-in required"
-    } else if error.contains("403") {
-        "access denied"
-    } else if error.contains("429") {
-        "too many requests"
-    } else if error.contains("invalid chatgpt usage response")
-        || error.contains("different account")
-    {
-        "invalid response"
-    } else {
-        "could not refresh"
-    }
+    let categories: &[(&[&str], &str)] = &[
+        (&["connect", "dns"], "connection error"),
+        (&["timed out", "timeout"], "request timed out"),
+        (
+            &["401", "authentication", "reauth", "invalid_grant"],
+            "sign-in required",
+        ),
+        (&["403"], "access denied"),
+        (&["429"], "too many requests"),
+        (
+            &["invalid chatgpt usage response", "different account"],
+            "invalid response",
+        ),
+    ];
+    categories
+        .iter()
+        .find(|(signals, _)| signals.iter().any(|signal| error.contains(signal)))
+        .map(|(_, label)| *label)
+        .unwrap_or("could not refresh")
 }
 
 fn reset_label(window: &LanguageModelUsageWindow) -> Option<String> {
@@ -135,14 +141,7 @@ fn reset_label_at(window: &LanguageModelUsageWindow, now: SystemTime) -> Option<
     let Ok(duration) = reset.duration_since(now) else {
         return Some("Reset time passed; refresh to update".into());
     };
-    let minutes = duration.as_secs().div_ceil(60).max(1);
-    let countdown = if minutes >= 1440 {
-        format!("{}d {}h", minutes / 1440, (minutes % 1440) / 60)
-    } else if minutes >= 60 {
-        format!("{}h {}m", minutes / 60, minutes % 60)
-    } else {
-        format!("{minutes}m")
-    };
+    let countdown = reset_countdown(duration);
     let seconds =
         i64::try_from(reset.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs()).ok()?;
     let date = chrono::DateTime::from_timestamp(seconds, 0)?.with_timezone(&chrono::Local);
@@ -152,13 +151,19 @@ fn reset_label_at(window: &LanguageModelUsageWindow, now: SystemTime) -> Option<
     ))
 }
 
-fn meter(
-    window: &LanguageModelUsageWindow,
-    muted: bool,
-    compact: bool,
-    cx: &App,
-) -> impl IntoElement {
-    let color = if muted {
+fn reset_countdown(duration: Duration) -> String {
+    let minutes = duration.as_secs().div_ceil(60).max(1);
+    if minutes >= 1440 {
+        format!("{}d {}h", minutes / 1440, (minutes % 1440) / 60)
+    } else if minutes >= 60 {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn meter_color(window: &LanguageModelUsageWindow, muted: bool, cx: &App) -> gpui::Hsla {
+    if muted {
         cx.theme().colors().text_muted
     } else if window
         .remaining_percent
@@ -167,20 +172,33 @@ fn meter(
         cx.theme().status().warning
     } else {
         cx.theme().status().info
-    };
+    }
+}
+
+fn meter_label(window: &LanguageModelUsageWindow, compact: bool) -> String {
+    if compact {
+        window
+            .remaining_percent
+            .map(|percent| format!("{percent:.0}%"))
+            .unwrap_or_else(|| "—".into())
+    } else {
+        remaining_label(window)
+    }
+}
+
+fn meter(
+    window: &LanguageModelUsageWindow,
+    muted: bool,
+    compact: bool,
+    cx: &App,
+) -> impl IntoElement {
+    let color = meter_color(window, muted, cx);
     v_flex()
         .gap_0p5()
         .child(
-            Label::new(if compact {
-                window
-                    .remaining_percent
-                    .map(|percent| format!("{percent:.0}%"))
-                    .unwrap_or_else(|| "—".into())
-            } else {
-                remaining_label(window)
-            })
-            .size(LabelSize::XSmall)
-            .color(if muted { Color::Muted } else { Color::Default }),
+            Label::new(meter_label(window, compact))
+                .size(LabelSize::XSmall)
+                .color(if muted { Color::Muted } else { Color::Default }),
         )
         .when_some(window.remaining_percent, |this, percent| {
             this.child(
@@ -198,6 +216,32 @@ fn meter(
                     ),
             )
         })
+}
+
+fn usage_tooltip(
+    included: Option<&LanguageModelUsageBucket>,
+    loading: bool,
+    stale: bool,
+    notice: Option<String>,
+) -> Vec<String> {
+    let mut tooltip = vec!["Selected account usage".to_owned()];
+    if let Some(included) = included {
+        tooltip.extend(included.windows.iter().map(remaining_label));
+    }
+    if loading {
+        tooltip.push("Refreshing usage…".into());
+    }
+    if stale {
+        tooltip.push("Stale usage; refresh to update".into());
+    }
+    if let Some(notice) = notice {
+        tooltip.push(notice);
+    }
+    tooltip
+}
+
+fn has_usage_warning(error: &Option<String>, notice: &Option<String>) -> bool {
+    error.is_some() || notice.is_some()
 }
 
 impl Render for AccountUsageView {
@@ -231,21 +275,9 @@ impl Render for AccountUsageView {
                     })
                     .map(|bucket| format!("{}: unavailable", bucket.name))
             });
-        let warning = error.is_some() || notice.is_some();
+        let warning = has_usage_warning(&error, &notice);
         let weak_view = cx.entity().downgrade();
-        let mut tooltip = vec!["Selected account usage".to_owned()];
-        if let Some(included) = included {
-            tooltip.extend(included.windows.iter().map(remaining_label));
-        }
-        if self.loading {
-            tooltip.push("Refreshing usage…".into());
-        }
-        if stale {
-            tooltip.push("Stale usage; refresh to update".into());
-        }
-        if let Some(notice) = notice {
-            tooltip.push(notice);
-        }
+        let tooltip = usage_tooltip(included, self.loading, stale, notice);
         let trigger = ButtonLike::new("account-usage-trigger").child(
             h_flex()
                 .gap_2()
@@ -317,6 +349,47 @@ impl Render for AccountUsageView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn usage_meter_distinguishes_low_unknown_and_stale_usage(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+            let mut window = LanguageModelUsageWindow {
+                label: "5h".into(),
+                remaining_percent: Some(75.),
+                resets_at: None,
+            };
+            assert_eq!(meter_color(&window, false, cx), cx.theme().status().info);
+            window.remaining_percent = Some(10.);
+            assert_eq!(meter_color(&window, false, cx), cx.theme().status().warning);
+            assert_eq!(
+                meter_color(&window, true, cx),
+                cx.theme().colors().text_muted
+            );
+            window.remaining_percent = None;
+            assert_eq!(meter_color(&window, false, cx), cx.theme().status().info);
+            let bucket = LanguageModelUsageBucket {
+                name: "Included usage".into(),
+                allowed: None,
+                limit_reached: None,
+                windows: vec![window],
+            };
+            assert_eq!(
+                usage_tooltip(Some(&bucket), true, true, Some("Quota exhausted".into())),
+                vec![
+                    "Selected account usage",
+                    "5h: unavailable",
+                    "Refreshing usage…",
+                    "Stale usage; refresh to update",
+                    "Quota exhausted"
+                ]
+            );
+            assert_eq!(
+                usage_tooltip(None, false, false, None),
+                vec!["Selected account usage"]
+            );
+        });
+    }
 
     #[test]
     fn availability_flags_override_remaining_percentages() {

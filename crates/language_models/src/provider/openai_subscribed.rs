@@ -128,15 +128,13 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
 
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let is_authenticated = self.state.read(cx).is_authenticated();
-        let title = if is_authenticated {
-            None
+        let (title, description) = if is_authenticated {
+            (None, None)
         } else {
-            Some("Configure ChatGPT".into())
-        };
-        let description = if is_authenticated {
-            None
-        } else {
-            Some(InlineDescription::Text(SUBSCRIPTION_DESCRIPTION.into()))
+            (
+                Some("Configure ChatGPT".into()),
+                Some(InlineDescription::Text(SUBSCRIPTION_DESCRIPTION.into())),
+            )
         };
 
         Some(ProviderSettingsView::Inline(
@@ -189,6 +187,14 @@ struct ConfigurationView {
     compact: bool,
 }
 
+fn signing_in_label(is_signing_in: bool, idle_label: &str) -> &str {
+    if is_signing_in {
+        "Signing in…"
+    } else {
+        idle_label
+    }
+}
+
 impl Render for ConfigurationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
@@ -205,15 +211,12 @@ impl Render for ConfigurationView {
 
         let is_signing_in = state.is_signing_in();
         let is_sign_in_cancellable = state.is_sign_in_cancellable();
-        let button_label = if is_signing_in {
-            "Signing in…"
+        let idle_label = if has_accounts {
+            "Add Account"
         } else {
-            if has_accounts {
-                "Add Account"
-            } else {
-                "Sign In"
-            }
+            "Sign In"
         };
+        let button_label = signing_in_label(is_signing_in, idle_label);
 
         v_flex()
             .gap_2()

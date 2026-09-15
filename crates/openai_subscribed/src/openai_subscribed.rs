@@ -160,17 +160,28 @@ async fn load_accounts(provider: &dyn CredentialsProvider, cx: &AsyncApp) -> Res
     };
     let mut accounts = Accounts::decode(&bytes)?;
     for (id, account) in &mut accounts.accounts {
-        if account.credentials.is_none() {
-            let key = account_credentials_key(id);
-            if let Some((_, bytes)) = provider.read_credentials(&key, cx).await? {
-                account.credentials = Some(serde_json::from_slice(&bytes)?);
-            } else {
-                account.needs_reauth = true;
-                account.status = "Saved credentials are missing. Sign in again".into();
-            }
-        }
+        load_account_credentials(provider, id, account, cx).await?;
     }
     Ok(accounts)
+}
+
+async fn load_account_credentials(
+    provider: &dyn CredentialsProvider,
+    id: &str,
+    account: &mut Account,
+    cx: &AsyncApp,
+) -> Result<()> {
+    if account.credentials.is_some() {
+        return Ok(());
+    }
+    let key = account_credentials_key(id);
+    if let Some((_, bytes)) = provider.read_credentials(&key, cx).await? {
+        account.credentials = Some(serde_json::from_slice(&bytes)?);
+    } else {
+        account.needs_reauth = true;
+        account.status = "Saved credentials are missing. Sign in again".into();
+    }
+    Ok(())
 }
 
 async fn save_accounts(
@@ -178,17 +189,53 @@ async fn save_accounts(
     accounts: &Accounts,
     cx: &AsyncApp,
 ) -> Result<()> {
-    let previous = match provider.read_credentials(CREDENTIALS_KEY, cx).await? {
-        Some((_, bytes)) => match Accounts::decode(&bytes) {
-            Ok(previous) => previous,
-            Err(error) if accounts.accounts.is_empty() => {
-                log::warn!("Removing unreadable ChatGPT credential index: {error}");
-                Accounts::default()
-            }
-            Err(error) => return Err(error),
-        },
-        None => Accounts::default(),
+    let previous = previous_accounts(provider, accounts.accounts.is_empty(), cx).await?;
+    let index = save_account_credentials(provider, accounts, cx).await?;
+    save_account_index(provider, &index, cx).await?;
+    remove_obsolete_credentials(provider, &previous, accounts, cx).await
+}
+
+async fn remove_obsolete_credentials(
+    provider: &dyn CredentialsProvider,
+    previous: &Accounts,
+    accounts: &Accounts,
+    cx: &AsyncApp,
+) -> Result<()> {
+    for id in previous
+        .accounts
+        .keys()
+        .filter(|id| !accounts.accounts.contains_key(*id))
+    {
+        provider
+            .delete_credentials(&account_credentials_key(id), cx)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn previous_accounts(
+    provider: &dyn CredentialsProvider,
+    removing_all: bool,
+    cx: &AsyncApp,
+) -> Result<Accounts> {
+    let Some((_, bytes)) = provider.read_credentials(CREDENTIALS_KEY, cx).await? else {
+        return Ok(Accounts::default());
     };
+    match Accounts::decode(&bytes) {
+        Ok(previous) => Ok(previous),
+        Err(error) if removing_all => {
+            log::warn!("Removing unreadable ChatGPT credential index: {error}");
+            Ok(Accounts::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn save_account_credentials(
+    provider: &dyn CredentialsProvider,
+    accounts: &Accounts,
+    cx: &AsyncApp,
+) -> Result<Accounts> {
     let mut index = accounts.clone();
     for (id, account) in &mut index.accounts {
         if let Some(credentials) = account.credentials.take() {
@@ -199,22 +246,21 @@ async fn save_accounts(
                 .await?;
         }
     }
+    Ok(index)
+}
+
+async fn save_account_index(
+    provider: &dyn CredentialsProvider,
+    index: &Accounts,
+    cx: &AsyncApp,
+) -> Result<()> {
     // Publish the index only after all credential records exist, preserving migration on failure.
-    if accounts.accounts.is_empty() {
+    if index.accounts.is_empty() {
         provider.delete_credentials(CREDENTIALS_KEY, cx).await?;
     } else {
         let bytes = serde_json::to_vec(&index)?;
         provider
             .write_credentials(CREDENTIALS_KEY, "Accounts", &bytes, cx)
-            .await?;
-    }
-    for id in previous
-        .accounts
-        .keys()
-        .filter(|id| !accounts.accounts.contains_key(*id))
-    {
-        provider
-            .delete_credentials(&account_credentials_key(id), cx)
             .await?;
     }
     Ok(())
@@ -1254,6 +1300,15 @@ enum AccountFailure {
     Other,
 }
 
+impl AccountFailure {
+    fn failover_scope(&self, previous: Option<String>) -> Option<String> {
+        match self {
+            Self::Scope(scope) => scope.clone(),
+            _ => previous,
+        }
+    }
+}
+
 fn classify_failure(error: &open_ai::RequestError) -> AccountFailure {
     let open_ai::RequestError::HttpResponseError {
         status_code,
@@ -1272,6 +1327,14 @@ fn classify_failure(error: &open_ai::RequestError) -> AccountFailure {
             AccountFailure::Other
         };
     };
+    classify_http_failure(*status_code, body, headers)
+}
+
+fn classify_http_failure(
+    status_code: http_client::StatusCode,
+    body: &str,
+    headers: &http_client::http::HeaderMap,
+) -> AccountFailure {
     let body_lower = body.to_ascii_lowercase();
     let payload = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
     let detail = payload.get("error").unwrap_or(&payload);
@@ -1295,12 +1358,7 @@ fn classify_failure(error: &open_ai::RequestError) -> AccountFailure {
     {
         return AccountFailure::Quota(reset.unwrap_or(u64::MAX));
     }
-    if status_code.as_u16() == 402
-        || (matches!(status_code.as_u16(), 403 | 429)
-            && ["billing", "no credit", "no_credit", "plan expired"]
-                .iter()
-                .any(|signal| body_lower.contains(signal)))
-    {
+    if is_billing_failure(status_code, &body_lower) {
         return AccountFailure::Billing;
     }
     if ["consent_required", "interaction_required", "login_required"]
@@ -1309,46 +1367,67 @@ fn classify_failure(error: &open_ai::RequestError) -> AccountFailure {
     {
         return AccountFailure::NeedsReauth;
     }
-    match status_code.as_u16() {
-        401 => AccountFailure::Unauthorized,
-        403 => AccountFailure::Scope(
-            detail
-                .get("required_scope")
-                .and_then(|value| value.as_str())
-                .or_else(|| {
-                    headers
-                        .get("www-authenticate")?
-                        .to_str()
-                        .ok()?
-                        .split("scope=\"")
-                        .nth(1)?
-                        .split('"')
-                        .next()
-                })
-                .filter(|scope| !scope.trim().is_empty())
-                .map(str::to_owned),
-        ),
-        429 => {
-            let delay = headers
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(30);
-            AccountFailure::RateLimit(now_ms().saturating_add(delay.max(1).saturating_mul(1000)))
-        }
-        500..=599 => AccountFailure::Transient,
-        _ => AccountFailure::Other,
+    classify_http_status(status_code, detail, headers)
+}
+
+fn is_billing_failure(status_code: http_client::StatusCode, body_lower: &str) -> bool {
+    status_code.as_u16() == 402
+        || (matches!(status_code.as_u16(), 403 | 429)
+            && ["billing", "no credit", "no_credit", "plan expired"]
+                .iter()
+                .any(|signal| body_lower.contains(signal)))
+}
+
+fn classify_http_status(
+    status_code: http_client::StatusCode,
+    detail: &serde_json::Value,
+    headers: &http_client::http::HeaderMap,
+) -> AccountFailure {
+    if status_code == http_client::StatusCode::FORBIDDEN {
+        return AccountFailure::Scope(required_scope(detail, headers));
     }
+    if status_code == http_client::StatusCode::TOO_MANY_REQUESTS {
+        let delay = headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30);
+        return AccountFailure::RateLimit(
+            now_ms().saturating_add(delay.max(1).saturating_mul(1000)),
+        );
+    }
+    if status_code == http_client::StatusCode::UNAUTHORIZED {
+        return AccountFailure::Unauthorized;
+    }
+    if status_code.is_server_error() {
+        return AccountFailure::Transient;
+    }
+    AccountFailure::Other
+}
+
+fn required_scope(
+    detail: &serde_json::Value,
+    headers: &http_client::http::HeaderMap,
+) -> Option<String> {
+    detail
+        .get("required_scope")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            headers
+                .get("www-authenticate")?
+                .to_str()
+                .ok()?
+                .split("scope=\"")
+                .nth(1)?
+                .split('"')
+                .next()
+        })
+        .filter(|scope| !scope.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn stream_event_error(event: &open_ai::responses::StreamEvent) -> Option<open_ai::RequestError> {
-    use open_ai::responses::StreamEvent;
-    let error = match event {
-        StreamEvent::Error { error } => error.clone(),
-        StreamEvent::Failed { response } => response.error.clone()?,
-        StreamEvent::GenericError { error } => error.clone().into_response_error(),
-        _ => return None,
-    };
+    let error = response_event_error(event)?;
     let signal = format!(
         "{} {} {}",
         error.code.as_deref().unwrap_or_default(),
@@ -1356,46 +1435,49 @@ fn stream_event_error(event: &open_ai::responses::StreamEvent) -> Option<open_ai
         error.message
     )
     .to_ascii_lowercase();
-    let status = if ["invalid_token", "expired_token", "authentication"]
-        .iter()
-        .any(|code| signal.contains(code))
-    {
-        401
-    } else if ["billing", "no credit"]
-        .iter()
-        .any(|code| signal.contains(code))
-    {
-        402
-    } else if [
-        "scope",
-        "permission",
-        "consent",
-        "login_required",
-        "interaction_required",
-    ]
-    .iter()
-    .any(|code| signal.contains(code))
-    {
-        403
-    } else if ["limit", "quota", "slow_down"]
-        .iter()
-        .any(|code| signal.contains(code))
-    {
-        429
-    } else if ["server_error", "timeout", "overloaded"]
-        .iter()
-        .any(|code| signal.contains(code))
-    {
-        503
-    } else {
-        400
-    };
+    let status = stream_error_status(&signal);
     Some(open_ai::RequestError::HttpResponseError {
         provider: PROVIDER_NAME.0.to_string(),
         status_code: http_client::StatusCode::from_u16(status).ok()?,
         body: serde_json::json!({ "error": error }).to_string(),
         headers: Box::default(),
     })
+}
+
+fn response_event_error(
+    event: &open_ai::responses::StreamEvent,
+) -> Option<open_ai::responses::ResponseError> {
+    use open_ai::responses::StreamEvent;
+    match event {
+        StreamEvent::Error { error } => Some(error.clone()),
+        StreamEvent::Failed { response } => response.error.clone(),
+        StreamEvent::GenericError { error } => Some(error.clone().into_response_error()),
+        _ => None,
+    }
+}
+
+fn stream_error_status(signal: &str) -> u16 {
+    let statuses: &[(&[&str], u16)] = &[
+        (&["invalid_token", "expired_token", "authentication"], 401),
+        (&["billing", "no credit"], 402),
+        (
+            &[
+                "scope",
+                "permission",
+                "consent",
+                "login_required",
+                "interaction_required",
+            ],
+            403,
+        ),
+        (&["limit", "quota", "slow_down"], 429),
+        (&["server_error", "timeout", "overloaded"], 503),
+    ];
+    statuses
+        .iter()
+        .find(|(codes, _)| codes.iter().any(|code| signal.contains(code)))
+        .map(|(_, status)| *status)
+        .unwrap_or(400)
 }
 
 async fn preflight_stream(
@@ -1405,7 +1487,6 @@ async fn preflight_stream(
     futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>,
     open_ai::RequestError,
 > {
-    use open_ai::responses::StreamEvent;
     let mut buffered = Vec::new();
     loop {
         let timeout = cx.background_executor().timer(Duration::from_secs(60));
@@ -1420,16 +1501,21 @@ async fn preflight_stream(
         if let Some(error) = stream_event_error(&event) {
             return Err(error);
         }
-        let metadata = matches!(
-            event,
-            StreamEvent::Created { .. } | StreamEvent::InProgress { .. } | StreamEvent::Unknown
-        );
+        let complete = preflight_complete(&event, buffered.len() + 1);
         buffered.push(Ok(event));
         // Once output has started, replay could duplicate text or tool calls.
-        if !metadata || buffered.len() >= 32 {
+        if complete {
             return Ok(futures::stream::iter(buffered).chain(stream).boxed());
         }
     }
+}
+
+fn preflight_complete(event: &open_ai::responses::StreamEvent, buffered: usize) -> bool {
+    use open_ai::responses::StreamEvent;
+    !matches!(
+        event,
+        StreamEvent::Created { .. } | StreamEvent::InProgress { .. } | StreamEvent::Unknown
+    ) || buffered >= 32
 }
 
 async fn record_account_failure(
@@ -1544,17 +1630,21 @@ fn monitor_account_stream(
     .boxed()
 }
 
+type AccountStream = futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>;
+
+struct AccountFailover {
+    error: Box<LanguageModelCompletionError>,
+    required_scope: Option<String>,
+}
+
 async fn stream_with_accounts(
     state: &WeakEntity<State>,
     http_client: &Arc<dyn HttpClient>,
     request: &open_ai::responses::Request,
     preferred: Option<&str>,
     cx: &mut AsyncApp,
-) -> Result<
-    futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>,
-    LanguageModelCompletionError,
-> {
-    let (mut candidates, policy) = state.read_with(cx, |state, _| {
+) -> Result<AccountStream, LanguageModelCompletionError> {
+    let (candidates, policy) = state.read_with(cx, |state, _| {
         let preferred = preferred.unwrap_or(&state.accounts.selected);
         let mut candidates = vec![preferred.to_owned()];
         if state.switch_policy() == AccountSwitchPolicy::OnError {
@@ -1569,124 +1659,243 @@ async fn stream_with_accounts(
         }
         (candidates, state.switch_policy())
     })?;
-    let mut last_error = None;
-    let mut required_scope: Option<String> = None;
-    for id in candidates.drain(..) {
-        let eligible = state.read_with(cx, |state, _| {
-            state.accounts.accounts.get(&id).is_some_and(|account| {
-                account.available(&request.model)
-                    && required_scope.as_ref().is_none_or(|scope| {
+    stream_from_candidates(state, http_client, request, candidates, policy, cx).await
+}
+
+async fn stream_from_candidates(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    request: &open_ai::responses::Request,
+    candidates: Vec<String>,
+    policy: AccountSwitchPolicy,
+    cx: &mut AsyncApp,
+) -> Result<AccountStream, LanguageModelCompletionError> {
+    let mut failure = AccountFailover {
+        error: Box::new(anyhow!(
+            "No eligible ChatGPT account. Check account status in Settings > AI > LLM Providers."
+        )
+        .into()),
+        required_scope: None,
+    };
+    for id in candidates {
+        match try_account_stream(state, http_client, request, &id, policy, failure, cx).await? {
+            Ok(stream) => return Ok(stream),
+            Err(next_failure) => failure = next_failure,
+        }
+    }
+    Err(*failure.error)
+}
+
+async fn try_account_stream(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    request: &open_ai::responses::Request,
+    id: &str,
+    policy: AccountSwitchPolicy,
+    previous_failure: AccountFailover,
+    cx: &mut AsyncApp,
+) -> Result<Result<AccountStream, AccountFailover>, LanguageModelCompletionError> {
+    let eligible = state.read_with(cx, |state, _| {
+        state.accounts.accounts.get(id).is_some_and(|account| {
+            account.available(&request.model)
+                && previous_failure
+                    .required_scope
+                    .as_ref()
+                    .is_none_or(|scope| {
                         account.credentials.as_ref().is_some_and(|credentials| {
                             scope.split_whitespace().all(|required| {
                                 credentials.scopes.iter().any(|granted| granted == required)
                             })
                         })
                     })
-            })
-        })?;
-        if !eligible {
-            continue;
+        })
+    })?;
+    if !eligible {
+        return Ok(Err(previous_failure));
+    }
+    let credentials = match account_credentials(state, http_client, id, None, cx).await {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            return Ok(Err(AccountFailover {
+                error: Box::new(error),
+                ..previous_failure
+            }));
         }
-        let mut credentials = match account_credentials(state, http_client, &id, None, cx).await {
-            Ok(credentials) => credentials,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
+    };
+    retry_account_stream(
+        state,
+        http_client,
+        request,
+        id,
+        policy,
+        credentials,
+        previous_failure.required_scope,
+        cx,
+    )
+    .await
+}
+
+struct AccountRetry {
+    credentials: CodexCredentials,
+    refreshed: bool,
+    retried: bool,
+}
+
+impl AccountRetry {
+    async fn refresh_credentials(
+        &mut self,
+        state: &WeakEntity<State>,
+        http_client: &Arc<dyn HttpClient>,
+        id: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<(), LanguageModelCompletionError> {
+        self.credentials = account_credentials(
+            state,
+            http_client,
+            id,
+            Some(&self.credentials.access_token),
+            cx,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn recover(
+        &mut self,
+        failure: &AccountFailure,
+        state: &WeakEntity<State>,
+        http_client: &Arc<dyn HttpClient>,
+        id: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<bool, LanguageModelCompletionError> {
+        if *failure == AccountFailure::Unauthorized && !self.refreshed {
+            self.refreshed = true;
+            return self
+                .refresh_credentials(state, http_client, id, cx)
+                .await
+                .map(|()| true);
+        }
+        if *failure == AccountFailure::Transient && !self.retried {
+            self.retried = true;
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+async fn retry_account_stream(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    request: &open_ai::responses::Request,
+    id: &str,
+    policy: AccountSwitchPolicy,
+    credentials: CodexCredentials,
+    required_scope: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<Result<AccountStream, AccountFailover>, LanguageModelCompletionError> {
+    let mut retry = AccountRetry {
+        credentials,
+        refreshed: false,
+        retried: false,
+    };
+    let mut result = request_account_stream(http_client, request, &retry.credentials, cx).await;
+    while let Err(error) = result {
+        let failure = classify_failure(&error);
+        match retry.recover(&failure, state, http_client, id, cx).await {
+            Ok(true) => {
+                result = request_account_stream(http_client, request, &retry.credentials, cx).await
             }
-        };
-        let mut refreshed = false;
-        let mut retried = false;
-        loop {
-            let headers = codex_extra_headers(&credentials, request.prompt_cache_key.as_deref());
-            let provider_name = PROVIDER_NAME;
-            let response = stream_response_ref(
-                http_client.as_ref(),
-                provider_name.0.as_str(),
-                CODEX_BASE_URL,
-                &credentials.access_token,
-                request,
-                &headers,
-            );
-            let timeout = cx.background_executor().timer(Duration::from_secs(60));
-            let result = futures::select! {
-                response = response.fuse() => response,
-                () = timeout.fuse() => Err(open_ai::RequestError::HttpSend { provider: PROVIDER_NAME.0.to_string(), host: "chatgpt.com".into(), error: anyhow!("Request timed out") }),
-            };
-            let result = match result {
-                Ok(stream) => preflight_stream(stream, cx).await,
-                Err(error) => Err(error),
-            };
-            let error = match result {
-                Ok(stream) => {
-                    return Ok(monitor_account_stream(
-                        state.clone(),
-                        http_client.clone(),
-                        id,
-                        request.model.clone(),
-                        credentials.access_token,
-                        stream,
-                        cx,
-                    ));
-                }
-                Err(error) => error,
-            };
-            let failure = classify_failure(&error);
-            if failure == AccountFailure::Unauthorized && !refreshed {
-                refreshed = true;
-                match account_credentials(
+            Ok(false) => {
+                return finish_account_failure(
                     state,
-                    http_client,
-                    &id,
-                    Some(&credentials.access_token),
+                    request,
+                    id,
+                    policy,
+                    &retry.credentials,
+                    failure,
+                    error,
+                    required_scope,
                     cx,
                 )
-                .await
-                {
-                    Ok(fresh) => {
-                        credentials = fresh;
-                        continue;
-                    }
-                    Err(error) => {
-                        last_error = Some(error);
-                        break;
-                    }
-                }
+                .await;
             }
-            if failure == AccountFailure::Transient && !retried {
-                retried = true;
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                continue;
+            Err(error) => {
+                return Ok(Err(AccountFailover {
+                    error: Box::new(error),
+                    required_scope,
+                }));
             }
-            let can_failover = match &failure {
-                AccountFailure::Other => false,
-                AccountFailure::Scope(scope) => {
-                    required_scope = scope.clone();
-                    scope.is_some()
-                }
-                _ => true,
-            };
-            record_account_failure(
-                state,
-                &id,
-                &request.model,
-                &credentials.access_token,
-                failure,
-                cx,
-            )
-            .await?;
-            if !can_failover || policy == AccountSwitchPolicy::Manual {
-                return Err(error.into());
-            }
-            last_error = Some(error.into());
-            break;
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        anyhow!(
-            "No eligible ChatGPT account. Check account status in Settings > AI > LLM Providers."
-        )
-        .into()
+    result
+        .map(|stream| {
+            Ok(monitor_account_stream(
+                state.clone(),
+                http_client.clone(),
+                id.to_owned(),
+                request.model.clone(),
+                retry.credentials.access_token,
+                stream,
+                cx,
+            ))
+        })
+        .map_err(Into::into)
+}
+
+async fn finish_account_failure(
+    state: &WeakEntity<State>,
+    request: &open_ai::responses::Request,
+    id: &str,
+    policy: AccountSwitchPolicy,
+    credentials: &CodexCredentials,
+    failure: AccountFailure,
+    error: open_ai::RequestError,
+    previous_scope: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<Result<AccountStream, AccountFailover>, LanguageModelCompletionError> {
+    let required_scope = failure.failover_scope(previous_scope);
+    let can_failover = !matches!(failure, AccountFailure::Other | AccountFailure::Scope(None));
+    record_account_failure(
+        state,
+        id,
+        &request.model,
+        &credentials.access_token,
+        failure,
+        cx,
+    )
+    .await?;
+    if !can_failover || policy == AccountSwitchPolicy::Manual {
+        return Err(error.into());
+    }
+    Ok(Err(AccountFailover {
+        error: Box::new(error.into()),
+        required_scope,
     }))
+}
+
+async fn request_account_stream(
+    http_client: &Arc<dyn HttpClient>,
+    request: &open_ai::responses::Request,
+    credentials: &CodexCredentials,
+    cx: &AsyncApp,
+) -> Result<AccountStream, open_ai::RequestError> {
+    let headers = codex_extra_headers(credentials, request.prompt_cache_key.as_deref());
+    let provider_name = PROVIDER_NAME;
+    let response = stream_response_ref(
+        http_client.as_ref(),
+        provider_name.0.as_str(),
+        CODEX_BASE_URL,
+        &credentials.access_token,
+        request,
+        &headers,
+    );
+    let timeout = cx.background_executor().timer(Duration::from_secs(60));
+    let stream = futures::select! {
+        response = response.fuse() => response,
+        () = timeout.fuse() => Err(open_ai::RequestError::HttpSend { provider: PROVIDER_NAME.0.to_string(), host: "chatgpt.com".into(), error: anyhow!("Request timed out") }),
+    }?;
+    preflight_stream(stream, cx).await
 }
 
 async fn get_fresh_credentials(
@@ -1707,6 +1916,12 @@ async fn refresh_with_timeout(
     futures::select! {
         result = refresh_token(http_client, refresh_token_value).fuse() => result,
         () = timeout.fuse() => Err(RefreshError::Transient(anyhow!("ChatGPT token refresh timed out"))),
+    }
+}
+
+impl CodexCredentials {
+    fn can_reuse(&self, rejected_token: Option<&str>) -> bool {
+        !self.is_expired() && rejected_token != Some(self.access_token.as_str())
     }
 }
 
@@ -1734,9 +1949,19 @@ async fn account_credentials(
     if let Some(task) = existing_task {
         return task.await.map_err(|error| anyhow!("{error}").into());
     }
-    if !credentials.is_expired() && rejected_token != Some(credentials.access_token.as_str()) {
+    if credentials.can_reuse(rejected_token) {
         return Ok(credentials);
     }
+    start_credentials_refresh(state, http_client, id, credentials, cx).await
+}
+
+async fn start_credentials_refresh(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    id: &str,
+    credentials: CodexCredentials,
+    cx: &mut AsyncApp,
+) -> Result<CodexCredentials, LanguageModelCompletionError> {
     let http_client = http_client.clone();
     let id = id.to_owned();
     let account_id = id.clone();
@@ -1843,94 +2068,136 @@ const CODEX_CALLBACK_PORT: u16 = 1455;
 const CODEX_CALLBACK_FALLBACK_PORT: u16 = 1457;
 const CODEX_CALLBACK_PATH: &str = "/auth/callback";
 
+struct OAuthFlow {
+    redirect_uri: String,
+    verifier: String,
+    oauth_state: String,
+    callback_rx:
+        futures::channel::oneshot::Receiver<Result<oauth_callback_server::OAuthCallbackParams>>,
+}
+
 async fn do_oauth_flow(
     http_client: Arc<dyn HttpClient>,
     cx: &AsyncApp,
 ) -> Result<CodexCredentials> {
-    // Start the callback server FIRST so the redirect URI is ready
-    let (redirect_uri, callback_rx) =
-        oauth_callback_server::start_oauth_callback_server_with_config(
-            oauth_callback_server::OAuthCallbackServerConfig {
-                host: CODEX_CALLBACK_HOST,
-                preferred_port: CODEX_CALLBACK_PORT,
-                fallback_port: Some(CODEX_CALLBACK_FALLBACK_PORT),
-                path: CODEX_CALLBACK_PATH,
-            },
-        )
-        .context("Failed to start OAuth callback server")?;
+    let flow = OAuthFlow::start(cx)?;
+    flow.finish(&http_client).await
+}
 
-    // PKCE verifier: 32 random bytes → base64url (no padding)
-    let mut verifier_bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut verifier_bytes);
-    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+impl OAuthFlow {
+    fn start(cx: &AsyncApp) -> Result<Self> {
+        // Start the callback server FIRST so the redirect URI is ready
+        let (redirect_uri, callback_rx) =
+            oauth_callback_server::start_oauth_callback_server_with_config(
+                oauth_callback_server::OAuthCallbackServerConfig {
+                    host: CODEX_CALLBACK_HOST,
+                    preferred_port: CODEX_CALLBACK_PORT,
+                    fallback_port: Some(CODEX_CALLBACK_FALLBACK_PORT),
+                    path: CODEX_CALLBACK_PATH,
+                },
+            )
+            .context("Failed to start OAuth callback server")?;
 
-    // PKCE challenge: SHA-256(verifier) → base64url
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize().as_slice());
+        // PKCE verifier: 32 random bytes → base64url (no padding)
+        let mut verifier_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut verifier_bytes);
+        let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
 
-    // CSRF state: 16 random bytes → hex string
-    let mut state_bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut state_bytes);
-    let oauth_state: String = state_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // PKCE challenge: SHA-256(verifier) → base64url
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize().as_slice());
 
-    let mut auth_url = url::Url::parse(OPENAI_AUTHORIZE_URL).expect("valid base URL");
-    auth_url
-        .query_pairs_mut()
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", &redirect_uri)
-        // Deliberately excludes `api.connectors.read api.connectors.invoke`
-        // (which Codex CLI requests): extra scopes inflate the
-        // access-token JWT, and the serialized credentials must fit within
-        // Windows Credential Manager's 2560-byte blob limit
-        // (CRED_MAX_CREDENTIAL_BLOB_SIZE). See #58541.
-        .append_pair("scope", "openid profile email offline_access")
-        .append_pair("prompt", "select_account")
-        .append_pair("response_type", "code")
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("id_token_add_organizations", "true")
-        .append_pair("state", &oauth_state)
-        .append_pair("codex_cli_simplified_flow", "true")
-        .append_pair("originator", "zed");
+        // CSRF state: 16 random bytes → hex string
+        let mut state_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut state_bytes);
+        let oauth_state: String = state_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Open browser AFTER the listener is ready
-    cx.update(|cx| cx.open_url(auth_url.as_str()));
-
-    // Await the callback
-    let callback = callback_rx
-        .await
-        .map_err(|_| anyhow!("OAuth callback was cancelled"))?
-        .context("OAuth callback failed")?;
-
-    // Validate CSRF state
-    if callback.state != oauth_state {
-        return Err(anyhow!("OAuth state mismatch"));
+        let flow = Self {
+            redirect_uri,
+            verifier,
+            oauth_state,
+            callback_rx,
+        };
+        flow.authorization_url(&challenge).map(|url| {
+            // The listener must exist before opening the browser.
+            cx.update(|cx| cx.open_url(url.as_str()));
+            flow
+        })
     }
 
-    let tokens = exchange_code(&http_client, &callback.code, &verifier, &redirect_uri)
+    fn authorization_url(&self, challenge: &str) -> Result<url::Url> {
+        let mut auth_url = url::Url::parse(OPENAI_AUTHORIZE_URL)?;
+        auth_url
+            .query_pairs_mut()
+            .append_pair("client_id", CLIENT_ID)
+            .append_pair("redirect_uri", &self.redirect_uri)
+            // Deliberately excludes `api.connectors.read api.connectors.invoke`
+            // (which Codex CLI requests): extra scopes inflate the
+            // access-token JWT, and the serialized credentials must fit within
+            // Windows Credential Manager's 2560-byte blob limit
+            // (CRED_MAX_CREDENTIAL_BLOB_SIZE). See #58541.
+            .append_pair("scope", "openid profile email offline_access")
+            .append_pair("prompt", "select_account")
+            .append_pair("response_type", "code")
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("id_token_add_organizations", "true")
+            .append_pair("state", &self.oauth_state)
+            .append_pair("codex_cli_simplified_flow", "true")
+            .append_pair("originator", "zed");
+
+        Ok(auth_url)
+    }
+
+    async fn finish(self, http_client: &Arc<dyn HttpClient>) -> Result<CodexCredentials> {
+        // Await the callback
+        let callback = self
+            .callback_rx
+            .await
+            .map_err(|_| anyhow!("OAuth callback was cancelled"))?
+            .context("OAuth callback failed")?;
+
+        // Validate CSRF state
+        if callback.state != self.oauth_state {
+            return Err(anyhow!("OAuth state mismatch"));
+        }
+
+        let tokens = exchange_code(
+            &http_client,
+            &callback.code,
+            &self.verifier,
+            &self.redirect_uri,
+        )
         .await
         .context("Token exchange failed")?;
 
-    let jwt = tokens
-        .id_token
-        .as_deref()
-        .unwrap_or(tokens.access_token.as_str());
-    let claims = extract_jwt_claims(jwt);
+        Ok(tokens.into_credentials())
+    }
+}
 
-    Ok(CodexCredentials {
-        access_token: tokens.access_token,
-        scopes: tokens
-            .scope
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect(),
-        refresh_token: tokens.refresh_token,
-        expires_at_ms: now_ms() + tokens.expires_in * 1000,
-        account_id: claims.account_id,
-        email: claims.email.or(tokens.email),
-    })
+impl TokenResponse {
+    fn into_credentials(self) -> CodexCredentials {
+        let jwt = self
+            .id_token
+            .as_deref()
+            .unwrap_or(self.access_token.as_str());
+        let claims = extract_jwt_claims(jwt);
+
+        CodexCredentials {
+            access_token: self.access_token,
+            scopes: self
+                .scope
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            refresh_token: self.refresh_token,
+            expires_at_ms: now_ms() + self.expires_in * 1000,
+            account_id: claims.account_id,
+            email: claims.email.or(self.email),
+        }
+    }
 }
 
 async fn exchange_code(
@@ -1994,14 +2261,18 @@ async fn refresh_token(
         .await
         .map_err(|e| RefreshError::Transient(e.into()))?;
 
+    decode_refreshed_credentials(status, &body)
+}
+
+fn decode_refreshed_credentials(
+    status: http_client::StatusCode,
+    body: &str,
+) -> Result<CodexCredentials, RefreshError> {
     if !status.is_success() {
         let err = anyhow!("Token refresh failed (HTTP {}): {body}", status);
         // 400/401/403 indicate a revoked or invalid refresh token.
         // 5xx and other errors are treated as transient.
-        if status == http_client::StatusCode::BAD_REQUEST
-            || status == http_client::StatusCode::UNAUTHORIZED
-            || status == http_client::StatusCode::FORBIDDEN
-        {
+        if matches!(status.as_u16(), 400 | 401 | 403) {
             return Err(RefreshError::Fatal(err));
         }
         return Err(RefreshError::Transient(err));
@@ -2009,25 +2280,7 @@ async fn refresh_token(
 
     let tokens: TokenResponse =
         serde_json::from_str(&body).map_err(|e| RefreshError::Transient(e.into()))?;
-    let jwt = tokens
-        .id_token
-        .as_deref()
-        .unwrap_or(tokens.access_token.as_str());
-    let claims = extract_jwt_claims(jwt);
-
-    Ok(CodexCredentials {
-        access_token: tokens.access_token,
-        scopes: tokens
-            .scope
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect(),
-        refresh_token: tokens.refresh_token,
-        expires_at_ms: now_ms() + tokens.expires_in * 1000,
-        account_id: claims.account_id,
-        email: claims.email.or(tokens.email),
-    })
+    Ok(tokens.into_credentials())
 }
 
 struct JwtClaims {
@@ -2104,6 +2357,108 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn oauth_validates_callback_state_before_exchanging_tokens() {
+        for state_matches in [true, false] {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            let flow = OAuthFlow {
+                redirect_uri: "http://localhost:1455/auth/callback".into(),
+                verifier: "verifier".into(),
+                oauth_state: "expected".into(),
+                callback_rx: receiver,
+            };
+            let url = flow
+                .authorization_url("challenge")
+                .expect("authorization URL");
+            let parameters: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(
+                parameters.get("state").map(String::as_str),
+                Some("expected")
+            );
+            assert_eq!(
+                parameters.get("prompt").map(String::as_str),
+                Some("select_account")
+            );
+            assert_eq!(
+                parameters.get("code_challenge").map(String::as_str),
+                Some("challenge")
+            );
+            assert!(
+                sender
+                    .send(Ok(oauth_callback_server::OAuthCallbackParams {
+                        code: "code".into(),
+                        state: if state_matches { "expected" } else { "wrong" }.into(),
+                    }))
+                    .is_ok()
+            );
+            let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |_| async move {
+                assert!(state_matches, "mismatched state must not exchange tokens");
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(fake_token_response()))?)
+            });
+            let result = futures::executor::block_on(flow.finish(&http));
+            if state_matches {
+                assert_eq!(result.expect("credentials").access_token, "fresh_access");
+            } else {
+                assert!(
+                    result
+                        .expect_err("state mismatch")
+                        .to_string()
+                        .contains("OAuth state mismatch")
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn quota_reset_and_account_removal_preserve_other_restrictions(cx: &mut TestAppContext) {
+        let http = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from(r#"{"models":[]}"#))?)
+        });
+        let mut credentials = make_fresh_credentials();
+        credentials.account_id = Some("first".into());
+        let state = make_state(http, Some(credentials), cx);
+        state.update(cx, |state, cx| {
+            let account = state.accounts.accounts.get_mut("first").expect("account");
+            account.quota_until_ms = u64::MAX;
+            account.status = "Plan quota reached".into();
+            account.billing_blocked = true;
+            state.reset_account_availability("first", cx);
+            let account = state.accounts.accounts.get("first").expect("account");
+            assert_eq!(account.quota_until_ms, 0);
+            assert!(account.billing_blocked);
+            assert!(account.status.is_empty());
+            let account = state.accounts.accounts.get_mut("first").expect("account");
+            account.needs_reauth = true;
+            account.quota_until_ms = u64::MAX;
+            state.reset_account_availability("first", cx);
+            assert_eq!(
+                state
+                    .accounts
+                    .accounts
+                    .get("first")
+                    .expect("account")
+                    .quota_until_ms,
+                u64::MAX
+            );
+            state.reset_account_availability("missing", cx);
+            let mut second = make_fresh_credentials();
+            second.account_id = Some("second".into());
+            state.accounts.insert(second);
+            state.accounts.selected = "first".into();
+            state.remove_account("first", cx);
+            assert_eq!(state.accounts.selected, "second");
+            assert!(!state.accounts.accounts.contains_key("first"));
+            state.remove_account("second", cx);
+            assert!(state.accounts.selected.is_empty());
+            assert!(!state.is_authenticated());
+        });
+        cx.run_until_parked();
+    }
 
     #[test]
     fn test_account_failure_classification() {
